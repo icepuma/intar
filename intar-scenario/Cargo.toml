@@ -1,0 +1,12 @@
+[package]
+name = "intar-scenario"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hcl-rs.workspace = true
+serde.workspace = true
+rust-embed.workspace = true

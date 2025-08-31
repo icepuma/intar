@@ -1,0 +1,15 @@
+[package]
+name = "intar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "intar"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+intar-scenario = { path = "../intar-scenario" }
