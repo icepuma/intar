@@ -25,7 +25,7 @@ enum ScenarioCommands {
     List,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {

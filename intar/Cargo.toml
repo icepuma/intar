@@ -12,4 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+anyhow.workspace = true
 intar-scenario = { path = "../intar-scenario" }
