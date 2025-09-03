@@ -14,3 +14,22 @@ path = "src/main.rs"
 clap.workspace = true
 anyhow.workspace = true
 intar-scenario = { path = "../intar-scenario" }
+intar-local-backend = { path = "../intar-local-backend" }
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+which.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+os_info.workspace = true
+directories.workspace = true
+chrono.workspace = true
+ssh-key.workspace = true
+uuid.workspace = true
+rand.workspace = true
+async-trait.workspace = true
+indicatif.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

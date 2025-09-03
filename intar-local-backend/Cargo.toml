@@ -1,0 +1,47 @@
+[package]
+name = "intar-local-backend"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Local QEMU backend implementation for intar"
+
+[dependencies]
+# Core async and error handling
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+bytes = "1"
+tracing = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# System interaction
+which = { workspace = true }
+tempfile = { workspace = true }
+directories = { workspace = true }
+
+# Time and random
+chrono = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+
+# SSH keys
+ssh-key = { workspace = true }
+
+# HTTP for image downloads
+reqwest = { workspace = true }
+
+# Dependencies on other intar crates
+intar-scenario = { path = "../intar-scenario" }
+
+# Async traits
+async-trait = { workspace = true }
+
+
+[dev-dependencies]
+tokio-test = "0.4"
