@@ -47,6 +47,17 @@ Areas covered by tests
 - PRs: include description, rationale, and logs/screenshots if UI/logging changed.
 - Keep changes focused; prefer small, reviewable PRs. Reference issues where applicable.
 
+### Conventional Commits (enforced)
+- Commit messages MUST follow Conventional Commits.
+- Format: `<type>(<scope>): <subject>` with optional `!` for breaking changes.
+- Types: `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+- Scopes: prefer crate names or areas, e.g., `intar-scenario`, `intar-local-backend`, `intar`.
+
+Examples
+- `feat(intar-scenario): add reusable manipulations`
+- `fix(intar-local-backend): ensure portable bash shebang`
+- `chore(intar): add scenario pre-check command`
+
 ## Security & Configuration Tips
 - No sudo required. QEMU is the only external dependency.
 - Acceleration: macOS `-accel hvf`; Linux `-enable-kvm` (ensure group perms).
