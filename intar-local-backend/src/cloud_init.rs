@@ -10,6 +10,7 @@ use crate::dirs::IntarDirs;
 const DEFAULT_USERNAME: &str = "intar";
 const CLOUD_CONFIG_HEADER: &str = "#cloud-config";
 
+/// Cloud-init generator and helpers for a single VM.
 pub struct CloudInitConfig {
     pub scenario_name: String,
     pub vm_name: String,
@@ -23,16 +24,27 @@ pub struct CloudInitConfig {
     pub manipulation_scripts: Vec<String>,
 }
 
+/// Configuration carrier for `CloudInitConfig::new` to keep the constructor
+/// signature concise and future-proof.
 #[derive(Clone)]
 pub struct CloudInitSpec {
+    /// Scenario name this VM belongs to.
     pub scenario_name: String,
+    /// VM name within the scenario.
     pub vm_name: String,
+    /// Directory layout helper for locating paths.
     pub dirs: IntarDirs,
+    /// Authorized SSH public key added for the default user.
     pub ssh_public_key: String,
+    /// VM index (0-based) within the scenario for deterministic IPs/ports.
     pub vm_index: u8,
+    /// Scenario ID derived from scenario name for network separation.
     pub scenario_id: u8,
+    /// All VM names in the scenario for hosts injection.
     pub all_vm_names: Vec<String>,
+    /// Packages required by manipulations (merged, deduped, order-preserved).
     pub manipulation_packages: Vec<String>,
+    /// Post-install scripts to be executed in order.
     pub manipulation_scripts: Vec<String>,
 }
 
@@ -100,7 +112,13 @@ impl CloudInitConfig {
     }
 
     /// Generate the user-data file content
-    /// Generate cloud-init user-data.
+    ///
+    /// Includes:
+    /// - default user and SSH key
+    /// - package installation (`manipulation_packages`)
+    /// - `/etc/hosts` injection for inter-VM name resolution
+    /// - one script per manipulation under `/var/lib/intar/manipulations-<n>.sh`
+    ///   with a portable bash shebang, invoked in order via `runcmd`.
     #[must_use]
     pub fn generate_user_data(&self) -> String {
         let hostname = format!("{}-{}", self.vm_name, self.scenario_name);

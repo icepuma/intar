@@ -47,27 +47,26 @@ Scenario spec (HCL)
   - VM resources: `vm "web" { cpus = 4 memory = 4096 }`
 
 Manipulations (post-install)
-- Define repeated per-VM `manipulation` blocks to run after cloud-init installs packages:
-  - All `packages` from all blocks are merged (deduped, order-preserved) and installed first.
-  - Each block’s `script` runs as root during `runcmd` in declaration order.
-  - Scripts are written to `/var/lib/intar/manipulations-<n>.sh`.
+- Define reusable scenario-level manipulations, then reference them per VM:
+  - All `packages` from referenced manipulations are merged (deduped, order-preserved) and installed first.
+  - Each manipulation’s `script` runs as root during `runcmd` in declaration order.
+  - Scripts are written to `/var/lib/intar/manipulations-<n>.sh` with a portable bash shebang.
 
 Example:
 ```
+manipulation "tools" {
+  packages = ["curl", "jq"]
+  script = <<EOF
+  echo "tools ready"
+  curl --version || true
+  jq --version || true
+  EOF
+}
+
 vm "toolbox" {
   cpus = 2
   memory = 2048
-  manipulation {
-    packages = ["curl"]
-    script = "echo first"
-  }
-  manipulation {
-    packages = ["jq"]
-    script = <<EOF
-    echo second
-    jq --version || true
-    EOF
-  }
+  manipulations = ["tools"]
 }
 ```
 

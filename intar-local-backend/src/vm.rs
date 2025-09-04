@@ -112,15 +112,25 @@ pub struct Vm {
     pub manipulations: Vec<Manipulation>,
 }
 
+/// Configuration carrier for creating a `Vm` without an excessively long
+/// constructor argument list. All fields are required.
 #[derive(Clone)]
 pub struct VmCreateSpec {
+    /// VM name
     pub name: String,
+    /// Scenario name
     pub scenario_name: String,
+    /// Directory layout helper
     pub dirs: IntarDirs,
+    /// VM index within the scenario
     pub vm_index: u8,
+    /// All VM names in the scenario (for hosts injection)
     pub all_vm_names: Vec<String>,
+    /// Number of vCPUs
     pub cpus: u8,
+    /// Memory size in MB
     pub memory_mb: u32,
+    /// Selected manipulations resolved from scenario definitions
     pub manipulations: Vec<Manipulation>,
 }
 

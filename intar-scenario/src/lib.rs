@@ -3,14 +3,15 @@ use rust_embed::RustEmbed;
 pub mod models;
 pub use models::*;
 
+/// Embedded HCL scenarios bundled at compile time from the `scenarios/` folder.
 #[derive(RustEmbed)]
 #[folder = "../scenarios/"]
 pub struct EmbeddedScenarios;
 
-/// Reads an embedded scenario by filename.
+/// Read an embedded scenario by filename and parse it into `Scenario`.
 ///
 /// # Errors
-/// Returns an error if the embedded file is not found or cannot be parsed.
+/// Returns an error if the embedded file is not found or HCL parsing fails.
 pub fn read_embedded_scenario(filename: &str) -> anyhow::Result<Scenario> {
     match EmbeddedScenarios::get(filename) {
         Some(file) => {
@@ -25,6 +26,7 @@ pub fn read_embedded_scenario(filename: &str) -> anyhow::Result<Scenario> {
     }
 }
 
+/// List all embedded scenarios by path name.
 #[must_use]
 pub fn list_embedded_scenarios() -> Vec<String> {
     EmbeddedScenarios::iter()

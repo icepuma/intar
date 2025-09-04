@@ -58,6 +58,20 @@ Examples
 - `fix(intar-local-backend): ensure portable bash shebang`
 - `chore(intar): add scenario pre-check command`
 
+## Documentation Requirements
+- Rustdoc: all public items must have `///` docs with a one-line summary and relevant sections.
+  - Sections: `# Examples`, `# Errors`, `# Panics`, `# Safety` (where applicable).
+  - Use crate/module header docs (`//!`) to explain purpose and design at a high level.
+  - Prefer runnable doctests; use `no_run` for examples that perform I/O or spawn processes.
+  - Link types and modules in docs using intra-doc links (e.g., `[CloudInitConfig]`).
+- Keep README and scenario spec examples in sync with code changes.
+  - Scenario HCL: document named `manipulation "name" {}` blocks and VM references via `manipulations = ["name", ...]`.
+  - Explain manipulation behavior (merged packages, portable bash shebang, script order, file paths).
+- Environment docs: document env vars affecting runtime (e.g., `INTAR_QMP_CONNECT_TIMEOUT_MS`, `INTAR_QMP_COMMAND_TIMEOUT_MS`).
+- Mark important return-value expectations with `#[must_use]` and document why when relevant.
+- When adding new features, update inline rustdoc, README, and any sample scenarios under `scenarios/`.
+- Preview docs locally with `cargo doc --no-deps` to catch warnings before submitting.
+
 ## Security & Configuration Tips
 - No sudo required. QEMU is the only external dependency.
 - Acceleration: macOS `-accel hvf`; Linux `-enable-kvm` (ensure group perms).
