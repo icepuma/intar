@@ -231,12 +231,12 @@ impl Backend for LocalBackend {
         Ok(())
     }
 
-    #[instrument(skip(self, scenario, _config))]
+    #[instrument(skip(self, scenario, config))]
     async fn create_vm(
         &self,
         vm_name: String,
         scenario: &Scenario,
-        _config: &VmConfig,
+        config: &VmConfig,
         vm_index: usize,
     ) -> Result<Box<dyn BackendVm>> {
         use crate::vm::Vm;
@@ -245,16 +245,30 @@ impl Backend for LocalBackend {
         let mut all_vm_names: Vec<String> = scenario.vm.keys().cloned().collect();
         all_vm_names.sort();
 
-        let mut vm = Vm::new_with_index(
-            vm_name,
-            scenario.name.clone(),
-            self.dirs.clone(),
-            u8::try_from(vm_index).unwrap_or(u8::MAX),
+        // Resolve manipulations by label from scenario definitions, preserving VM declaration order
+        let selected_manipulations = {
+            let mut v = Vec::new();
+            for label in &config.manipulations {
+                if let Some(def) = scenario.manipulations.get(label) {
+                    v.push(def.clone());
+                } else {
+                    tracing::warn!("Manipulation '{}' not defined; skipping", label);
+                }
+            }
+            v
+        };
+
+        let mut vm = Vm::new_with_spec(crate::vm::VmCreateSpec {
+            name: vm_name,
+            scenario_name: scenario.name.clone(),
+            dirs: self.dirs.clone(),
+            vm_index: u8::try_from(vm_index).unwrap_or(u8::MAX),
             all_vm_names,
             // Apply VM resource hints if provided
-            _config.cpus,
-            _config.memory,
-        )
+            cpus: config.cpus,
+            memory_mb: config.memory,
+            manipulations: selected_manipulations,
+        })
         .context("Failed to create VM")?;
 
         // Set the base image from the scenario
@@ -348,6 +362,7 @@ impl Backend for LocalBackend {
                         image: String::new(), // These fields aren't used for loading state
                         sha256: None,
                         vm: HashMap::new(),
+                        manipulations: indexmap::IndexMap::new(),
                     },
                 )
                 .await?
@@ -374,6 +389,7 @@ impl Backend for LocalBackend {
                         image: String::new(),
                         sha256: None,
                         vm: HashMap::new(),
+                        manipulations: indexmap::IndexMap::new(),
                     },
                 )
                 .await?

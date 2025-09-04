@@ -39,6 +39,9 @@ impl ScenarioRunner {
     /// # Errors
     /// Returns an error if backend preparation or VM creation fails.
     pub async fn prepare(&mut self) -> Result<()> {
+        // Validate scenario references before any expensive work
+        validate_scenario_references(&self.scenario)?;
+
         // Let the backend handle preparation
         self.backend
             .prepare_scenario(&self.scenario)
@@ -197,6 +200,30 @@ impl ScenarioRunner {
 
         Ok(runner)
     }
+}
+
+/// Validate that all VM-declared manipulation references exist in the scenario.
+fn validate_scenario_references(scenario: &Scenario) -> Result<()> {
+    use anyhow::bail;
+
+    let defined: std::collections::HashSet<&str> =
+        scenario.manipulations.keys().map(String::as_str).collect();
+
+    for (vm_name, vm) in &scenario.vm {
+        for label in &vm.manipulations {
+            if !defined.contains(label.as_str()) {
+                bail!(
+                    "Scenario '{}' VM '{}' references unknown manipulation '{}'. Define it with: manipulation \"{}\" {{ ... }}",
+                    scenario.name,
+                    vm_name,
+                    label,
+                    label
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl Drop for ScenarioRunner {

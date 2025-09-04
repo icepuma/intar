@@ -10,10 +10,11 @@ use tokio::fs;
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
-use crate::cloud_init::{CloudInitConfig, calculate_scenario_id};
+use crate::cloud_init::{CloudInitConfig, CloudInitSpec, calculate_scenario_id};
 use crate::constants::{HOSTFWD_BASE_PORT, hub_port, lan_ip as calc_lan_ip};
 use crate::dirs::IntarDirs;
 use crate::system::QemuConfig;
+use intar_scenario::Manipulation;
 
 // QMP connection is now handled by our custom QMP client
 
@@ -106,38 +107,45 @@ pub struct Vm {
     // Resources
     pub cpus: u8,
     pub memory_mb: u32,
+
+    // Scenario-provided manipulation blocks for cloud-init
+    pub manipulations: Vec<Manipulation>,
+}
+
+#[derive(Clone)]
+pub struct VmCreateSpec {
+    pub name: String,
+    pub scenario_name: String,
+    pub dirs: IntarDirs,
+    pub vm_index: u8,
+    pub all_vm_names: Vec<String>,
+    pub cpus: u8,
+    pub memory_mb: u32,
+    pub manipulations: Vec<Manipulation>,
 }
 
 impl Vm {
-    /// Create a new VM with the specified index within the scenario
     /// Create a VM instance with its index within the scenario.
     ///
     /// # Errors
     /// Returns an error if QEMU configuration detection fails.
-    pub fn new_with_index(
-        name: String,
-        scenario_name: String,
-        dirs: IntarDirs,
-        vm_index: u8,
-        all_vm_names: Vec<String>,
-        cpus: u8,
-        memory_mb: u32,
-    ) -> Result<Self> {
+    pub fn new_with_spec(spec: VmCreateSpec) -> Result<Self> {
         let qemu_config = QemuConfig::detect().context(FAILED_TO_DETECT_QEMU)?;
 
-        let pid_file = dirs.vm_pid_file(&scenario_name, &name);
-        let qmp_socket = dirs.vm_qmp_socket(&scenario_name, &name);
-        let disk_path = dirs.vm_disk_path(&scenario_name, &name);
-        let log_file = dirs.vm_log_file(&scenario_name, &name);
-        let state_file = dirs.vm_state_file(&scenario_name, &name);
+        let pid_file = spec.dirs.vm_pid_file(&spec.scenario_name, &spec.name);
+        let qmp_socket = spec.dirs.vm_qmp_socket(&spec.scenario_name, &spec.name);
+        let disk_path = spec.dirs.vm_disk_path(&spec.scenario_name, &spec.name);
+        let log_file = spec.dirs.vm_log_file(&spec.scenario_name, &spec.name);
+        let state_file = spec.dirs.vm_state_file(&spec.scenario_name, &spec.name);
 
         // Create network configuration
-        let network = Self::create_network_config(&scenario_name, &name, vm_index, &dirs);
+        let network =
+            Self::create_network_config(&spec.scenario_name, &spec.name, spec.vm_index, &spec.dirs);
 
         Ok(Self {
-            name,
-            scenario_name,
-            dirs,
+            name: spec.name,
+            scenario_name: spec.scenario_name,
+            dirs: spec.dirs,
             pid_file,
             qmp_socket,
             disk_path,
@@ -147,9 +155,10 @@ impl Vm {
             qemu_config,
             process: None,
             network,
-            all_vm_names,
-            cpus,
-            memory_mb,
+            all_vm_names: spec.all_vm_names,
+            cpus: spec.cpus,
+            memory_mb: spec.memory_mb,
+            manipulations: spec.manipulations,
         })
     }
 
@@ -163,15 +172,17 @@ impl Vm {
         let scenario_id = calculate_scenario_id(scenario_name);
 
         // Generate MAC addresses
-        let cloud_init = CloudInitConfig::new(
-            scenario_name.to_string(),
-            vm_name.to_string(),
-            dirs.clone(),
-            String::new(), // SSH key will be set later
+        let cloud_init = CloudInitConfig::new(CloudInitSpec {
+            scenario_name: scenario_name.to_string(),
+            vm_name: vm_name.to_string(),
+            dirs: dirs.clone(),
+            ssh_public_key: String::new(), // SSH key will be set later
             vm_index,
             scenario_id,
-            vec![], // VM names not available here, will be set later in setup_cloud_init
-        );
+            all_vm_names: vec![], // VM names not available here
+            manipulation_packages: vec![],
+            manipulation_scripts: vec![],
+        });
         let (eth0_mac, eth1_mac) = cloud_init.generate_mac_addresses();
 
         // SSH port allocation and LAN details via shared constants/helpers
@@ -209,15 +220,16 @@ impl Vm {
             serde_json::from_str(&state_content).context(FAILED_TO_PARSE_VM_STATE)?;
 
         // Reconstruct VM with network configuration from state
-        let mut vm = Self::new_with_index(
-            vm_name,
+        let mut vm = Self::new_with_spec(VmCreateSpec {
+            name: vm_name,
             scenario_name,
             dirs,
-            vm_state.network.vm_index,
-            vec![],
-            vm_state.cpus,
-            vm_state.memory_mb,
-        )?;
+            vm_index: vm_state.network.vm_index,
+            all_vm_names: vec![],
+            cpus: vm_state.cpus,
+            memory_mb: vm_state.memory_mb,
+            manipulations: Vec::new(),
+        })?;
 
         // Restore the actual paths from saved state to ensure consistency
         vm.pid_file = PathBuf::from(&vm_state.pid_file);
@@ -242,15 +254,34 @@ impl Vm {
     /// # Errors
     /// Returns an error if any file operations fail.
     pub async fn setup_cloud_init(&self, ssh_public_key: String) -> Result<PathBuf> {
-        let cloud_init = CloudInitConfig::new(
-            self.scenario_name.clone(),
-            self.name.clone(),
-            self.dirs.clone(),
+        // Merge packages across manipulation blocks (preserve order, dedupe)
+        let mut merged_packages: Vec<String> = Vec::new();
+        for m in &self.manipulations {
+            for p in &m.packages {
+                if !merged_packages.contains(p) {
+                    merged_packages.push(p.clone());
+                }
+            }
+        }
+
+        // Collect scripts in declared order
+        let scripts: Vec<String> = self
+            .manipulations
+            .iter()
+            .filter_map(|m| m.script.clone())
+            .collect();
+
+        let cloud_init = CloudInitConfig::new(CloudInitSpec {
+            scenario_name: self.scenario_name.clone(),
+            vm_name: self.name.clone(),
+            dirs: self.dirs.clone(),
             ssh_public_key,
-            self.network.vm_index,
-            self.network.scenario_id,
-            self.all_vm_names.clone(),
-        );
+            vm_index: self.network.vm_index,
+            scenario_id: self.network.scenario_id,
+            all_vm_names: self.all_vm_names.clone(),
+            manipulation_packages: merged_packages,
+            manipulation_scripts: scripts,
+        });
 
         cloud_init.create_config_files().await
     }

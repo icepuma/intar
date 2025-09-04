@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -13,6 +14,11 @@ pub struct Scenario {
     pub sha256: Option<String>,
     #[serde(default)]
     pub vm: HashMap<String, VmConfig>,
+
+    /// Reusable manipulation definitions (labeled HCL blocks)
+    /// Usage inside a VM via labeled `manipulation "name" {}` blocks
+    #[serde(default, rename = "manipulation")]
+    pub manipulations: IndexMap<String, Manipulation>,
 }
 
 #[cfg(test)]
@@ -51,9 +57,46 @@ mod tests {
         assert_eq!(cfg.cpus, 4);
         assert_eq!(cfg.memory, 4096);
     }
+
+    #[test]
+    fn parse_with_multiple_manipulation_blocks() {
+        let hcl = r#"
+            name = "ManipDemo"
+            image = "https://example.com/x.img"
+            manipulation "first" {
+              packages = ["curl"]
+              script = "echo first"
+            }
+            manipulation "second" {
+              packages = ["jq"]
+              script = <<EOF
+              echo second
+              jq --version || true
+              EOF
+            }
+            vm "toolbox" {
+              cpus = 2
+              memory = 2048
+              manipulations = ["first", "second"]
+            }
+        "#;
+        let s: Scenario = hcl::from_str(hcl).expect("parse");
+        let cfg = s.vm.get("toolbox").unwrap();
+        assert_eq!(cfg.manipulations, vec!["first", "second"]);
+        assert_eq!(s.manipulations.get("first").unwrap().packages, vec!["curl"]);
+        assert!(
+            s.manipulations
+                .get("second")
+                .unwrap()
+                .script
+                .as_ref()
+                .unwrap()
+                .contains("jq --version")
+        );
+    }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct VmConfig {
     /// Number of CPUs for this VM (defaults to 2)
     #[serde(default = "default_cpus")]
@@ -70,9 +113,14 @@ pub struct VmConfig {
     /// Custom network configuration for this VM (optional)
     #[serde(default)]
     pub network: Option<NetworkConfig>,
+
+    /// References to reusable manipulation definitions by label.
+    /// Declare as a simple list: `manipulations = ["tools", "jq"]`.
+    #[serde(default)]
+    pub manipulations: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct NetworkConfig {
     /// Static IP address override for the private network interface
     /// If not specified, will be auto-assigned based on VM index
@@ -83,7 +131,7 @@ pub struct NetworkConfig {
     pub routes: Vec<NetworkRoute>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct NetworkRoute {
     /// Destination network (e.g., "192.168.1.0/24")
     pub to: String,
@@ -95,6 +143,21 @@ pub struct NetworkRoute {
     #[serde(default = "default_route_metric")]
     pub metric: u32,
 }
+
+/// Scenario-defined post-provisioning manipulation block (one script)
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct Manipulation {
+    /// Packages to install prior to running the manipulation script
+    #[serde(default)]
+    pub packages: Vec<String>,
+
+    /// Shell script to run (single or multiline)
+    /// Runs as root during cloud-init runcmd.
+    #[serde(default)]
+    pub script: Option<String>,
+}
+
+// Empty ref type removed: we now reference by string labels for simplicity
 
 // Default values
 const fn default_cpus() -> u8 {

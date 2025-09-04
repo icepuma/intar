@@ -18,28 +18,38 @@ pub struct CloudInitConfig {
     pub vm_index: u8,              // For IP allocation within scenario
     pub scenario_id: u8,           // For scenario network separation
     pub all_vm_names: Vec<String>, // All VM names in the scenario for hostname resolution
+    // Manipulations support
+    pub manipulation_packages: Vec<String>,
+    pub manipulation_scripts: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct CloudInitSpec {
+    pub scenario_name: String,
+    pub vm_name: String,
+    pub dirs: IntarDirs,
+    pub ssh_public_key: String,
+    pub vm_index: u8,
+    pub scenario_id: u8,
+    pub all_vm_names: Vec<String>,
+    pub manipulation_packages: Vec<String>,
+    pub manipulation_scripts: Vec<String>,
 }
 
 impl CloudInitConfig {
     /// Create a new cloud-init config helper for a VM.
     #[must_use]
-    pub const fn new(
-        scenario_name: String,
-        vm_name: String,
-        dirs: IntarDirs,
-        ssh_public_key: String,
-        vm_index: u8,
-        scenario_id: u8,
-        all_vm_names: Vec<String>,
-    ) -> Self {
+    pub fn new(spec: CloudInitSpec) -> Self {
         Self {
-            scenario_name,
-            vm_name,
-            dirs,
-            ssh_public_key,
-            vm_index,
-            scenario_id,
-            all_vm_names,
+            scenario_name: spec.scenario_name,
+            vm_name: spec.vm_name,
+            dirs: spec.dirs,
+            ssh_public_key: spec.ssh_public_key,
+            vm_index: spec.vm_index,
+            scenario_id: spec.scenario_id,
+            all_vm_names: spec.all_vm_names,
+            manipulation_packages: spec.manipulation_packages,
+            manipulation_scripts: spec.manipulation_scripts,
         }
     }
 
@@ -94,9 +104,58 @@ impl CloudInitConfig {
     #[must_use]
     pub fn generate_user_data(&self) -> String {
         let hostname = format!("{}-{}", self.vm_name, self.scenario_name);
+        // Compose packages list (manipulation packages only for now)
+        let packages_yaml = if self.manipulation_packages.is_empty() {
+            "[]".to_string()
+        } else {
+            // YAML inline list of strings
+            let quoted: Vec<String> = self
+                .manipulation_packages
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect();
+            format!("[{}]", quoted.join(", "))
+        };
 
-        format!(
-            r#"{header}
+        // Prepare write_files for hosts and optional manipulation scripts
+        let (host_write_file_item, runcmd_base_yaml) =
+            self.generate_hosts_write_files_and_runcmd_items();
+
+        // Optional multiple manipulation scripts write_files and runcmd entries
+        let mut manip_write_file_items = String::new();
+        let mut manip_runcmd_items = String::new();
+        for (i, script) in self.manipulation_scripts.iter().enumerate() {
+            let idx = i + 1;
+            // Ensure a portable bash shebang is present
+            let body = if script.trim_start().starts_with("#!") {
+                script.clone()
+            } else {
+                format!("#!/usr/bin/env bash\n{script}")
+            };
+            let content = body.replace('\n', "\n      ");
+            let path = format!("/var/lib/intar/manipulations-{idx}.sh");
+            let _ = write!(
+                manip_write_file_items,
+                r"  - path: {path}
+    owner: root:root
+    permissions: '0755'
+    content: |
+      {content}
+"
+            );
+            let _ = writeln!(manip_runcmd_items, "  - {path}");
+        }
+
+        // Compose final YAML
+        let mut out = String::new();
+        let package_update = if self.manipulation_packages.is_empty() {
+            "false"
+        } else {
+            "true"
+        };
+        let _ = write!(
+            out,
+            r"{header}
 hostname: {hostname}
 manage_etc_hosts: true
 
@@ -117,29 +176,44 @@ ssh_pwauth: false
 disable_root: true
 
 # Package management (faster boot)
-package_update: false
+package_update: {package_update}
 package_upgrade: false
-packages: []
+packages: {packages}
 
 # System configuration
 timezone: UTC
 locale: en_US.UTF-8
 
-{hosts_config}
-
-# Cloud-init final message
-final_message: "Cloud-init setup complete for {hostname}"
-"#,
+",
             header = CLOUD_CONFIG_HEADER,
             hostname = hostname,
             username = DEFAULT_USERNAME,
             ssh_public_key = self.ssh_public_key.trim(),
-            hosts_config = self.generate_hosts_config(),
-        )
+            packages = packages_yaml,
+            package_update = package_update,
+        );
+
+        // write_files list
+        out.push_str("write_files:\n");
+        out.push_str(&host_write_file_item);
+        out.push_str(&manip_write_file_items);
+
+        // runcmd section
+        out.push_str("runcmd:\n");
+        out.push_str(&runcmd_base_yaml);
+        out.push_str(&manip_runcmd_items);
+
+        // Final message
+        let _ = write!(
+            out,
+            "# Cloud-init final message\nfinal_message: \"Cloud-init setup complete for {hostname}\"\n"
+        );
+
+        out
     }
 
-    /// Generate /etc/hosts entries for all VMs in the scenario
-    fn generate_hosts_config(&self) -> String {
+    /// Generate /etc/hosts entries for all VMs and runcmd items to apply them
+    fn generate_hosts_write_files_and_runcmd_items(&self) -> (String, String) {
         // Poor man's DNS via /etc/hosts using deterministic LAN IPs
         let mut all = self.all_vm_names.clone();
         all.sort();
@@ -158,23 +232,27 @@ final_message: "Cloud-init setup complete for {hostname}"
             );
         }
 
-        // Use write_files to stage a hosts fragment and runcmd to append and mask slow services
-        format!(
-            r#"write_files:
-  - path: /etc/hosts.intar
+        // Use write_files to stage a hosts fragment
+        let write_file_item = format!(
+            r"  - path: /etc/hosts.intar
     owner: root:root
     permissions: '0644'
     content: |
       {entries}
-runcmd:
-  - bash -c 'grep -q "^# intar hosts (scenario " /etc/hosts || cat /etc/hosts.intar >> /etc/hosts'
-  - systemctl mask systemd-networkd-wait-online.service || true
-  - systemctl disable --now apt-daily.service apt-daily.timer || true
-  - systemctl disable --now apt-daily-upgrade.service apt-daily-upgrade.timer || true
-  - systemctl disable --now motd-news.service motd-news.timer || true
-"#,
+",
             entries = entries.replace('\n', "\n      ")
-        )
+        );
+
+        // Base runcmd items: append hosts and mask/disable slow services
+        let runcmd_items = String::from(concat!(
+            "  - bash -c 'grep -q \"^# intar hosts (scenario \" /etc/hosts || cat /etc/hosts.intar >> /etc/hosts'\n",
+            "  - systemctl mask systemd-networkd-wait-online.service || true\n",
+            "  - systemctl disable --now apt-daily.service apt-daily.timer || true\n",
+            "  - systemctl disable --now apt-daily-upgrade.service apt-daily-upgrade.timer || true\n",
+            "  - systemctl disable --now motd-news.service motd-news.timer || true\n",
+        ));
+
+        (write_file_item, runcmd_items)
     }
 
     /// Generate the meta-data file content
@@ -310,15 +388,17 @@ mod tests {
     #[test]
     fn network_config_contains_expected_lan_ip() {
         let dirs = IntarDirs::new().expect("dirs");
-        let cfg = CloudInitConfig::new(
-            "ScenarioX".into(),
-            "vm1".into(),
+        let cfg = CloudInitConfig::new(CloudInitSpec {
+            scenario_name: "ScenarioX".into(),
+            vm_name: "vm1".into(),
             dirs,
-            "ssh-rsa AAA...".into(),
-            0,
-            42,
-            vec!["vm1".into(), "vm2".into()],
-        );
+            ssh_public_key: "ssh-rsa AAA...".into(),
+            vm_index: 0,
+            scenario_id: 42,
+            all_vm_names: vec!["vm1".into(), "vm2".into()],
+            manipulation_packages: vec![],
+            manipulation_scripts: vec![],
+        });
         let net = cfg.generate_network_config();
         assert!(net.contains("172.30.42.10/24"), "net={net}");
     }
@@ -326,15 +406,17 @@ mod tests {
     #[test]
     fn user_data_contains_hosts_and_sshkey() {
         let dirs = IntarDirs::new().expect("dirs");
-        let cfg = CloudInitConfig::new(
-            "MultiDemo".into(),
-            "web".into(),
+        let cfg = CloudInitConfig::new(CloudInitSpec {
+            scenario_name: "MultiDemo".into(),
+            vm_name: "web".into(),
             dirs,
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA".into(),
-            0,
-            10,
-            vec!["web".into(), "db".into(), "cache".into()],
-        );
+            ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA".into(),
+            vm_index: 0,
+            scenario_id: 10,
+            all_vm_names: vec!["web".into(), "db".into(), "cache".into()],
+            manipulation_packages: vec![],
+            manipulation_scripts: vec![],
+        });
         let user = cfg.generate_user_data();
         assert!(user.starts_with("#cloud-config"));
         assert!(user.contains("ssh_authorized_keys"));
@@ -343,6 +425,27 @@ mod tests {
             user.contains("db db-MultiDemo db.MultiDemo"),
             "user-data={user}",
         );
+    }
+
+    #[test]
+    fn user_data_includes_manipulations() {
+        let dirs = IntarDirs::new().expect("dirs");
+        let cfg = CloudInitConfig::new(CloudInitSpec {
+            scenario_name: "ManipDemo".into(),
+            vm_name: "toolbox".into(),
+            dirs,
+            ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA".into(),
+            vm_index: 0,
+            scenario_id: 7,
+            all_vm_names: vec!["toolbox".into()],
+            manipulation_packages: vec!["curl".into(), "jq".into()],
+            manipulation_scripts: vec!["echo one".into(), "echo two".into()],
+        });
+        let user = cfg.generate_user_data();
+        assert!(user.contains("packages: ['curl', 'jq']"), "{user}");
+        assert!(user.contains("/var/lib/intar/manipulations-1.sh"), "{user}");
+        assert!(user.contains("/var/lib/intar/manipulations-2.sh"), "{user}");
+        assert!(user.contains("runcmd:"), "{user}");
     }
 
     #[test]

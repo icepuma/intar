@@ -15,3 +15,4 @@ hcl-rs.workspace = true
 serde.workspace = true
 rust-embed.workspace = true
 anyhow.workspace = true
+indexmap.workspace = true

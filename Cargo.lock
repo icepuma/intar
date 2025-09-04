@@ -1146,6 +1146,7 @@ dependencies = [
  "directories",
  "futures-util",
  "hex",
+ "indexmap",
  "intar-scenario",
  "rand",
  "reqwest",
@@ -1168,6 +1169,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hcl-rs",
+ "indexmap",
  "rust-embed",
  "serde",
 ]
