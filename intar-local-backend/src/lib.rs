@@ -2,6 +2,7 @@ pub mod backend;
 pub mod cloud_init;
 pub mod constants;
 pub mod dirs;
+pub mod hub;
 pub mod qmp;
 pub mod ssh;
 pub mod system;

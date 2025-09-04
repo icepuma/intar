@@ -8,7 +8,7 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use super::codec::QmpCodec;
-use super::models::*;
+use super::models::{QmpCommand, QmpGreeting, QmpResponse, StatusInfo, VmRunState};
 use crate::backend::VmStatus;
 
 /// Async QMP client for communicating with QEMU
@@ -18,12 +18,21 @@ pub struct QmpClient {
 }
 
 impl QmpClient {
-    /// Connect to a QMP socket and perform handshake
+    fn env_timeout_ms(var: &str, default_ms: u64) -> Duration {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or_else(|| Duration::from_millis(default_ms), Duration::from_millis)
+    }
+    /// Connect to a QMP socket and perform handshake.
+    ///
+    /// # Errors
+    /// Returns an error if the socket cannot be connected or if the QMP handshake fails.
     pub async fn connect(socket_path: &Path) -> Result<Self> {
-        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+        let connect_timeout = Self::env_timeout_ms("INTAR_QMP_CONNECT_TIMEOUT_MS", 10_000);
 
         // Connect to the Unix socket with timeout
-        let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(socket_path))
+        let stream = timeout(connect_timeout, UnixStream::connect(socket_path))
             .await
             .with_context(|| {
                 format!(
@@ -38,7 +47,7 @@ impl QmpClient {
         let mut framed = Framed::new(stream, QmpCodec::new());
 
         // Read QMP greeting
-        let greeting_msg = timeout(CONNECT_TIMEOUT, framed.next())
+        let greeting_msg = timeout(connect_timeout, framed.next())
             .await
             .context("Timed out waiting for QMP greeting")?
             .ok_or_else(|| anyhow::anyhow!("Connection closed before receiving greeting"))?
@@ -58,7 +67,7 @@ impl QmpClient {
             .context("Failed to send qmp_capabilities command")?;
 
         // Read capabilities response
-        let capabilities_response = timeout(CONNECT_TIMEOUT, framed.next())
+        let capabilities_response = timeout(connect_timeout, framed.next())
             .await
             .context("Timed out waiting for capabilities response")?
             .ok_or_else(|| anyhow::anyhow!("Connection closed during capabilities negotiation"))?
@@ -84,13 +93,16 @@ impl QmpClient {
     }
 
     /// Get QMP greeting information
-    pub fn greeting(&self) -> &QmpGreeting {
+    pub const fn greeting(&self) -> &QmpGreeting {
         &self.greeting
     }
 
-    /// Execute a QMP command with optional arguments
+    /// Execute a QMP command with optional arguments.
+    ///
+    /// # Errors
+    /// Returns an error if sending fails or if the response parsing fails.
     pub async fn execute_command(&mut self, command: &str, args: Option<Value>) -> Result<Value> {
-        const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+        let command_timeout = Self::env_timeout_ms("INTAR_QMP_COMMAND_TIMEOUT_MS", 10_000);
 
         let id = Uuid::new_v4().to_string();
         let cmd = QmpCommand::new(command).with_id(id.clone());
@@ -109,14 +121,14 @@ impl QmpClient {
             .context("Failed to send QMP command")?;
 
         // Read response
-        let response_value = timeout(COMMAND_TIMEOUT, self.framed.next())
+        let response_value = timeout(command_timeout, self.framed.next())
             .await
-            .with_context(|| format!("Timed out waiting for response to command '{}'", command))?
+            .with_context(|| format!("Timed out waiting for response to command '{command}'"))?
             .ok_or_else(|| anyhow::anyhow!("Connection closed while waiting for command response"))?
-            .with_context(|| format!("Failed to read response for command '{}'", command))?;
+            .with_context(|| format!("Failed to read response for command '{command}'"))?;
 
         let response: QmpResponse = serde_json::from_value(response_value)
-            .with_context(|| format!("Failed to parse response for command '{}'", command))?;
+            .with_context(|| format!("Failed to parse response for command '{command}'"))?;
 
         match response {
             QmpResponse::Success { result, .. } => Ok(result),
@@ -131,7 +143,10 @@ impl QmpClient {
         }
     }
 
-    /// Query VM status
+    /// Query VM status.
+    ///
+    /// # Errors
+    /// Returns an error if the `query-status` command fails.
     pub async fn query_status(&mut self) -> Result<VmStatus> {
         let result = self
             .execute_command("query-status", None)
@@ -144,17 +159,18 @@ impl QmpClient {
         // Convert QMP VmRunState to our VmStatus
         let vm_status = match status_info.status {
             VmRunState::Running => VmStatus::Running,
-            VmRunState::Paused => VmStatus::Paused,
             VmRunState::Shutdown => VmStatus::Stopped,
-            VmRunState::Debug => VmStatus::Paused,
-            VmRunState::Suspended => VmStatus::Paused,
+            VmRunState::Paused | VmRunState::Debug | VmRunState::Suspended => VmStatus::Paused,
             VmRunState::Unknown => VmStatus::Unknown,
         };
 
         Ok(vm_status)
     }
 
-    /// Send quit command to shutdown QEMU
+    /// Send quit command to shutdown QEMU.
+    ///
+    /// # Errors
+    /// Returns an error if sending the `quit` command fails.
     pub async fn quit(&mut self) -> Result<()> {
         self.execute_command("quit", None)
             .await
@@ -162,7 +178,10 @@ impl QmpClient {
         Ok(())
     }
 
-    /// Close the QMP connection gracefully
+    /// Close the QMP connection gracefully.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying framed connection cannot be closed.
     pub async fn close(mut self) -> Result<()> {
         self.framed
             .close()

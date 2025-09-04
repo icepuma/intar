@@ -6,6 +6,9 @@ authors = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 description = "Local QEMU backend implementation for intar"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # Core async and error handling
@@ -35,6 +38,8 @@ ssh-key = { workspace = true }
 
 # HTTP for image downloads
 reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 # Dependencies on other intar crates
 intar-scenario = { path = "../intar-scenario" }

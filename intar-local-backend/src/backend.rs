@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use intar_scenario::{Scenario, VmConfig};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
 /// VM status that is backend-agnostic
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VmStatus {
     Running,
     Stopped,
@@ -19,10 +20,10 @@ pub enum VmStatus {
 impl std::fmt::Display for VmStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VmStatus::Running => write!(f, "🟢 Running"),
-            VmStatus::Stopped => write!(f, "🔴 Stopped"),
-            VmStatus::Paused => write!(f, "🟡 Paused"),
-            VmStatus::Unknown => write!(f, "❓ Unknown"),
+            Self::Running => write!(f, "🟢 Running"),
+            Self::Stopped => write!(f, "🔴 Stopped"),
+            Self::Paused => write!(f, "🟡 Paused"),
+            Self::Unknown => write!(f, "❓ Unknown"),
         }
     }
 }
@@ -107,6 +108,10 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
+    /// Create a new `LocalBackend`.
+    ///
+    /// # Errors
+    /// Returns an error if directory initialization fails.
     pub fn new() -> Result<Self> {
         let dirs = crate::dirs::IntarDirs::new().context("Failed to initialize IntarDirs")?;
 
@@ -114,7 +119,6 @@ impl LocalBackend {
     }
 }
 
-#[async_trait]
 #[async_trait]
 impl Backend for LocalBackend {
     fn name(&self) -> &'static str {
@@ -127,12 +131,16 @@ impl Backend for LocalBackend {
         use futures_util::StreamExt;
         use tokio::fs::File;
         use tokio::io::AsyncWriteExt;
+        use which::which;
 
         // Initialize all required directories
         self.dirs
             .init()
             .await
             .context("Failed to initialize intar directories")?;
+
+        // Validate required external tools
+        which("qemu-img").context("'qemu-img' not found in PATH (install QEMU tools)")?;
 
         // Generate SSH keys for this scenario
         let ssh_manager = SshKeyManager::new(scenario.name.clone(), self.dirs.clone());
@@ -141,21 +149,21 @@ impl Backend for LocalBackend {
             .await
             .context("Failed to generate SSH keys for scenario")?;
 
-        // Download base image if it doesn't exist
-        let image_filename = scenario
-            .image
-            .split('/')
-            .next_back()
-            .unwrap_or("base-image")
-            .to_string();
-
-        let image_filename = if image_filename.contains('.') {
-            image_filename
-        } else {
-            format!("{}.qcow2", image_filename)
-        };
-
-        let image_path = self.dirs.cached_image_path(&image_filename);
+        // Compute a cache filename based on URL hash to avoid collisions
+        let url = scenario.image.clone();
+        let last_seg = url.split('/').next_back().unwrap_or("");
+        let ext = last_seg
+            .rsplit('.')
+            .next()
+            .filter(|s| !s.is_empty() && *s != last_seg);
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(url.as_bytes());
+        let url_hash = hex::encode(hasher.finalize());
+        let filename = ext.map_or_else(
+            || format!("{url_hash}.qcow2"),
+            |e| format!("{url_hash}.{e}"),
+        );
+        let image_path = self.dirs.cached_image_path(&filename);
 
         if !image_path.exists() {
             tracing::info!("Downloading base image: {}", scenario.image);
@@ -175,17 +183,47 @@ impl Backend for LocalBackend {
                     .context("Failed to create image cache directory")?;
             }
 
-            let mut file = File::create(&image_path).await.with_context(|| {
-                format!("Failed to create image file: {}", image_path.display())
-            })?;
+            // Stream to a temporary file, compute SHA256 on the fly
+            let part_path = image_path.with_extension(format!("part-{}", uuid::Uuid::new_v4()));
+            let mut file = File::create(&part_path)
+                .await
+                .with_context(|| format!("Failed to create image file: {}", part_path.display()))?;
 
             let mut stream = response.bytes_stream();
+            let mut hasher = sha2::Sha256::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.context("Failed to download image chunk")?;
+                hasher.update(&chunk);
                 file.write_all(&chunk)
                     .await
                     .context("Failed to write image data")?;
             }
+
+            // Verify checksum if provided
+            if let Some(expected_hex) = &scenario.sha256 {
+                let actual = hasher.finalize();
+                let actual_hex = hex::encode(actual);
+                if actual_hex.to_lowercase() != expected_hex.trim().to_lowercase() {
+                    // Remove partial
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    anyhow::bail!(
+                        "Image checksum mismatch. expected={}, actual={}",
+                        expected_hex,
+                        actual_hex
+                    );
+                }
+            }
+
+            // Atomic rename into place
+            tokio::fs::rename(&part_path, &image_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to move downloaded image into place: {} -> {}",
+                        part_path.display(),
+                        image_path.display()
+                    )
+                })?;
 
             tracing::info!("Base image downloaded: {}", image_path.display());
         }
@@ -211,8 +249,11 @@ impl Backend for LocalBackend {
             vm_name,
             scenario.name.clone(),
             self.dirs.clone(),
-            vm_index as u8,
+            u8::try_from(vm_index).unwrap_or(u8::MAX),
             all_vm_names,
+            // Apply VM resource hints if provided
+            _config.cpus,
+            _config.memory,
         )
         .context("Failed to create VM")?;
 
@@ -227,7 +268,7 @@ impl Backend for LocalBackend {
         let image_filename = if image_filename.contains('.') {
             image_filename
         } else {
-            format!("{}.qcow2", image_filename)
+            format!("{image_filename}.qcow2")
         };
 
         let image_path = self.dirs.cached_image_path(&image_filename);
@@ -305,6 +346,7 @@ impl Backend for LocalBackend {
                         name: scenario_name.to_string(),
                         description: String::new(),
                         image: String::new(), // These fields aren't used for loading state
+                        sha256: None,
                         vm: HashMap::new(),
                     },
                 )
@@ -330,6 +372,7 @@ impl Backend for LocalBackend {
                         name: scenario_name.to_string(),
                         description: String::new(),
                         image: String::new(),
+                        sha256: None,
                         vm: HashMap::new(),
                     },
                 )
@@ -372,7 +415,7 @@ impl Backend for LocalBackend {
     }
 }
 
-/// Wrapper for Vm that provides interior mutability for BackendVm trait
+/// Wrapper for Vm that provides interior mutability for `BackendVm` trait
 pub struct VmWrapper {
     inner: Arc<Mutex<crate::vm::Vm>>,
 }

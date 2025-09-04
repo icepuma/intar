@@ -39,6 +39,7 @@ pub struct QmpCommand {
 }
 
 impl QmpCommand {
+    #[must_use]
     pub fn new(command: &str) -> Self {
         Self {
             execute: command.to_string(),
@@ -47,11 +48,13 @@ impl QmpCommand {
         }
     }
 
+    #[must_use]
     pub fn with_id(mut self, id: String) -> Self {
         self.id = Some(id);
         self
     }
 
+    #[must_use]
     pub fn with_args(mut self, args: Value) -> Self {
         self.arguments = Some(args);
         self

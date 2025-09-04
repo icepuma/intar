@@ -14,7 +14,8 @@ pub struct SshKeyManager {
 }
 
 impl SshKeyManager {
-    pub fn new(scenario_name: String, dirs: IntarDirs) -> Self {
+    #[must_use]
+    pub const fn new(scenario_name: String, dirs: IntarDirs) -> Self {
         Self {
             scenario_name,
             dirs,
@@ -22,6 +23,7 @@ impl SshKeyManager {
     }
 
     /// Get the paths where SSH keys should be stored for this scenario
+    #[must_use]
     pub fn get_key_paths(&self) -> (PathBuf, PathBuf) {
         let key_dir = self.dirs.data_scenario_ssh_keys_dir(&self.scenario_name);
         let private_key_path = key_dir.join("id_ed25519");
@@ -32,10 +34,16 @@ impl SshKeyManager {
     /// Check if SSH keys already exist for this scenario
     pub async fn keys_exist(&self) -> bool {
         let (private_path, public_path) = self.get_key_paths();
-        private_path.exists() && public_path.exists()
+        let priv_ok = fs::metadata(&private_path).await.is_ok();
+        let pub_ok = fs::metadata(&public_path).await.is_ok();
+        priv_ok && pub_ok
     }
 
     /// Generate new ed25519 SSH keypair for this scenario
+    /// Generate a new ed25519 SSH keypair for this scenario.
+    ///
+    /// # Errors
+    /// Returns an error if generation or file writes fail.
     pub async fn generate_keypair(&self) -> Result<()> {
         if self.keys_exist().await {
             return Ok(()); // Keys already exist, no need to generate
@@ -89,20 +97,31 @@ impl SshKeyManager {
                 .await
                 .context("Failed to set private key file permissions")?;
         }
+        #[cfg(not(unix))]
+        {
+            tracing::warn!(
+                "Unable to set strict private key permissions on this platform: {}",
+                private_path.display()
+            );
+        }
 
         // Save public key (644 permissions are fine)
         fs::write(&public_path, public_key_data)
             .await
             .with_context(|| format!("Failed to write public key to {}", public_path.display()))?;
 
-        println!("Generated SSH keypair for scenario: {}", self.scenario_name);
-        println!("  Private key: {}", private_path.display());
-        println!("  Public key: {}", public_path.display());
+        tracing::info!("Generated SSH keypair for scenario: {}", self.scenario_name);
+        tracing::info!("  Private key: {}", private_path.display());
+        tracing::info!("  Public key: {}", public_path.display());
 
         Ok(())
     }
 
     /// Read the public key content for inclusion in cloud-init
+    /// Read the public key content for inclusion in cloud-init.
+    ///
+    /// # Errors
+    /// Returns an error if the key cannot be read.
     pub async fn read_public_key(&self) -> Result<String> {
         let (_, public_path) = self.get_key_paths();
 
@@ -121,12 +140,16 @@ impl SshKeyManager {
     }
 
     /// Get the private key path for SSH client usage
+    #[must_use]
     pub fn get_private_key_path(&self) -> PathBuf {
         let (private_path, _) = self.get_key_paths();
         private_path
     }
 
-    /// Ensure SSH keys exist, generating them if needed
+    /// Ensure SSH keys exist, generating them if needed.
+    ///
+    /// # Errors
+    /// Returns an error if key generation fails.
     pub async fn ensure_keys(&self) -> Result<()> {
         if !self.keys_exist().await {
             self.generate_keypair().await?;
@@ -134,7 +157,10 @@ impl SshKeyManager {
         Ok(())
     }
 
-    /// Remove SSH keys for this scenario (used during cleanup)
+    /// Remove SSH keys for this scenario (used during cleanup).
+    ///
+    /// # Errors
+    /// Returns an error if removing files fails unexpectedly.
     pub async fn cleanup_keys(&self) -> Result<()> {
         let (private_path, public_path) = self.get_key_paths();
 

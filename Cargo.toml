@@ -8,6 +8,10 @@ edition = "2024"
 authors = ["Your Name <your.email@example.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yourusername/intar"
+description = "Rootless QEMU scenario runner with dual-NIC networking and UDP LAN hub"
+readme = "README.md"
+keywords = ["qemu", "vm", "cloud-init", "cli", "scenarios"]
+categories = ["command-line-utilities", "virtualization"]
 
 [workspace.dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
@@ -32,3 +36,5 @@ async-trait = "0.1"
 indicatif = "0.18.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+sha2 = "0.10"
+hex = "0.4"

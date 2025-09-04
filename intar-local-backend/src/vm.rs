@@ -45,11 +45,24 @@ pub struct VmState {
 
     // Network configuration
     pub network: VmNetworkState,
+
+    // Resources
+    #[serde(default = "default_cpus_state")]
+    pub cpus: u8,
+    #[serde(default = "default_memory_state")]
+    pub memory_mb: u32,
+}
+
+const fn default_cpus_state() -> u8 {
+    1
+}
+const fn default_memory_state() -> u32 {
+    1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmNetworkState {
-    /// SSH port forwarding port on the host (not needed with socket_vmnet but kept for compatibility)
+    /// SSH port forwarding port on the host (not needed with `socket_vmnet` but kept for compatibility)
     pub ssh_port: u16,
 
     /// MAC address for eth0 (single network interface)
@@ -89,16 +102,26 @@ pub struct Vm {
 
     // All VM names in the scenario for hostname resolution
     pub all_vm_names: Vec<String>,
+
+    // Resources
+    pub cpus: u8,
+    pub memory_mb: u32,
 }
 
 impl Vm {
     /// Create a new VM with the specified index within the scenario
+    /// Create a VM instance with its index within the scenario.
+    ///
+    /// # Errors
+    /// Returns an error if QEMU configuration detection fails.
     pub fn new_with_index(
         name: String,
         scenario_name: String,
         dirs: IntarDirs,
         vm_index: u8,
         all_vm_names: Vec<String>,
+        cpus: u8,
+        memory_mb: u32,
     ) -> Result<Self> {
         let qemu_config = QemuConfig::detect().context(FAILED_TO_DETECT_QEMU)?;
 
@@ -125,6 +148,8 @@ impl Vm {
             process: None,
             network,
             all_vm_names,
+            cpus,
+            memory_mb,
         })
     }
 
@@ -150,7 +175,7 @@ impl Vm {
         let (eth0_mac, eth1_mac) = cloud_init.generate_mac_addresses();
 
         // SSH port allocation and LAN details via shared constants/helpers
-        let ssh_port = HOSTFWD_BASE_PORT + (vm_index as u16);
+        let ssh_port = HOSTFWD_BASE_PORT + u16::from(vm_index);
         let lan_port: u16 = hub_port(scenario_id);
         let lan_ip = calc_lan_ip(scenario_id, vm_index);
 
@@ -165,6 +190,10 @@ impl Vm {
         }
     }
 
+    /// Rebuild a VM object from its persisted state on disk.
+    ///
+    /// # Errors
+    /// Returns an error if state cannot be read or parsed.
     pub async fn from_state(
         scenario_name: String,
         vm_name: String,
@@ -173,7 +202,7 @@ impl Vm {
         let state_file = dirs.vm_state_file(&scenario_name, &vm_name);
         let state_content = fs::read_to_string(&state_file)
             .await
-            .with_context(|| format!("{}: {}", FAILED_TO_READ_VM_STATE, state_file.display()))?;
+            .with_context(|| format!("{FAILED_TO_READ_VM_STATE}: {}", state_file.display()))?;
 
         // Parse the state file to get network configuration
         let vm_state: VmState =
@@ -186,6 +215,8 @@ impl Vm {
             dirs,
             vm_state.network.vm_index,
             vec![],
+            vm_state.cpus,
+            vm_state.memory_mb,
         )?;
 
         // Restore the actual paths from saved state to ensure consistency
@@ -206,6 +237,10 @@ impl Vm {
 
     /// Set up cloud-init configuration with SSH key
     #[instrument(skip(self, ssh_public_key))]
+    /// Set up cloud-init configuration with the provided SSH key.
+    ///
+    /// # Errors
+    /// Returns an error if any file operations fail.
     pub async fn setup_cloud_init(&self, ssh_public_key: String) -> Result<PathBuf> {
         let cloud_init = CloudInitConfig::new(
             self.scenario_name.clone(),
@@ -221,6 +256,7 @@ impl Vm {
     }
 
     /// Get network information for display
+    #[must_use]
     pub fn get_network_info(&self) -> String {
         format!(
             "SSH: ssh -i <key> -p {} intar@127.0.0.1\nPrivate LAN IP: {} ({})",
@@ -231,68 +267,155 @@ impl Vm {
     }
 
     /// Get SSH connection information (port only - IP assigned via static config)
-    pub fn get_ssh_info(&self) -> u16 {
+    #[must_use]
+    pub const fn get_ssh_info(&self) -> u16 {
         self.network.ssh_port
     }
 
     // Removed socket_vmnet IP discovery. LAN IP is deterministic via scenario+index.
 
     /// Add cloud-init ISO drive to QEMU command
+    ///
+    /// # Panics
+    /// Panics if `cloud_init_dir` has no parent directory (should not happen).
+    ///
+    /// # Errors
+    /// Returns an error if creating or attaching the ISO image fails.
     pub async fn add_cloud_init_drive(
         &self,
         cmd: &mut Command,
         cloud_init_dir: &std::path::Path,
     ) -> Result<()> {
-        // Create ISO image from cloud-init directory for better compatibility
-        let iso_path = cloud_init_dir.parent().unwrap().join("cloud-init.iso");
+        let iso_path = self.create_cloud_init_iso(cloud_init_dir).await?;
+        cmd.args([
+            "-drive",
+            &format!("file={},media=cdrom,readonly=on", iso_path.display()),
+        ]);
+        Ok(())
+    }
 
-        // Remove existing ISO file if it exists
+    /// Create a cloud-init ISO for the given seed directory.
+    ///
+    /// # Errors
+    /// Returns an error if ISO creation fails.
+    async fn create_cloud_init_iso(
+        &self,
+        cloud_init_dir: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        use tokio::process::Command as TokioCommand;
+        // Create ISO path
+        let iso_path = cloud_init_dir.parent().unwrap().join("cloud-init.iso");
         if iso_path.exists() {
             tokio::fs::remove_file(&iso_path).await.with_context(|| {
                 format!("Failed to remove existing ISO: {}", iso_path.display())
             })?;
         }
 
-        // Create ISO using hdiutil on macOS (genisoimage equivalent)
-        // Add volume label for NoCloud datasource detection
-        let output = Command::new("hdiutil")
-            .args([
-                "makehybrid",
-                "-iso",
-                "-joliet",
-                "-default-volume-name",
-                "cidata", // Volume label required for NoCloud
-                "-o",
-                &iso_path.to_string_lossy(),
-                &cloud_init_dir.to_string_lossy(),
-            ])
-            .output()
-            .await
-            .context("Failed to run hdiutil to create cloud-init ISO")?;
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "Failed to create cloud-init ISO: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+        #[cfg(target_os = "macos")]
+        {
+            let output = TokioCommand::new("hdiutil")
+                .args([
+                    "makehybrid",
+                    "-iso",
+                    "-joliet",
+                    "-default-volume-name",
+                    "cidata",
+                    "-o",
+                    &iso_path.to_string_lossy(),
+                    &cloud_init_dir.to_string_lossy(),
+                ])
+                .output()
+                .await
+                .context("Failed to run hdiutil to create cloud-init ISO")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Failed to create cloud-init ISO: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
-
-        // Add the ISO as a CDROM drive with volume label for NoCloud detection
-        cmd.args([
-            "-drive",
-            &format!("file={},media=cdrom,readonly=on", iso_path.display()),
-        ]);
-
-        Ok(())
+        #[cfg(not(target_os = "macos"))]
+        {
+            use which::which;
+            let iso_str = iso_path.to_string_lossy().to_string();
+            let dir_str = cloud_init_dir.to_string_lossy().to_string();
+            let (bin, args): (String, Vec<String>) = if which("genisoimage").is_ok() {
+                (
+                    "genisoimage".into(),
+                    vec![
+                        "-output".into(),
+                        iso_str.clone(),
+                        "-volid".into(),
+                        "cidata".into(),
+                        "-joliet".into(),
+                        "-rock".into(),
+                        dir_str.clone(),
+                    ],
+                )
+            } else if which("mkisofs").is_ok() {
+                (
+                    "mkisofs".into(),
+                    vec![
+                        "-o".into(),
+                        iso_str.clone(),
+                        "-V".into(),
+                        "cidata".into(),
+                        "-J".into(),
+                        "-r".into(),
+                        dir_str.clone(),
+                    ],
+                )
+            } else if which("xorriso").is_ok() {
+                (
+                    "xorriso".into(),
+                    vec![
+                        "-as".into(),
+                        "mkisofs".into(),
+                        "-V".into(),
+                        "cidata".into(),
+                        "-J".into(),
+                        "-l".into(),
+                        "-r".into(),
+                        "-o".into(),
+                        iso_str.clone(),
+                        dir_str.clone(),
+                    ],
+                )
+            } else {
+                anyhow::bail!(
+                    "No ISO creation tool found. Install one of: genisoimage, mkisofs, xorriso"
+                );
+            };
+            let output = TokioCommand::new(&bin)
+                .args(&args)
+                .output()
+                .await
+                .with_context(|| format!("Failed to run {bin} to create cloud-init ISO"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Failed to create cloud-init ISO using {}: {}",
+                    bin,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        Ok(iso_path)
     }
 
-    /// Start VM with cloud-init configuration
+    /// Start VM with cloud-init configuration.
+    ///
+    /// # Errors
+    /// Returns an error if starting QEMU fails or if the ISO cannot be attached.
     #[instrument(skip(self, cloud_init_dir))]
     pub async fn start_with_cloud_init(&mut self, cloud_init_dir: &std::path::Path) -> Result<()> {
         self.start_internal(Some(cloud_init_dir)).await
     }
 
     #[instrument(skip(self))]
+    /// Start the VM without cloud-init.
+    ///
+    /// # Errors
+    /// Returns an error if QEMU fails to start.
     pub async fn start(&mut self) -> Result<()> {
         self.start_internal(None).await
     }
@@ -330,42 +453,40 @@ impl Vm {
         let drive_config = format!("file={},if=virtio,format=qcow2", self.disk_path.display());
         let qmp_config = format!("unix:{},server,nowait", self.qmp_socket.display());
 
-        let mut qemu_args = vec![
-            "-machine",
-            &self.qemu_config.machine,
-            "-cpu",
-            &self.qemu_config.cpu,
-            "-smp",
-            "1",
-            "-m",
-            "1024M",
+        let mut qemu_args: Vec<String> = vec![
+            "-machine".into(),
+            self.qemu_config.machine.clone(),
+            "-cpu".into(),
+            self.qemu_config.cpu.clone(),
+            "-smp".into(),
+            self.cpus.to_string(),
+            "-m".into(),
+            format!("{}M", self.memory_mb),
             // NAT NIC for SSH and internet access
-            "-netdev",
-            &user_netdev,
-            "-device",
-            &user_device,
+            "-netdev".into(),
+            user_netdev.clone(),
+            "-device".into(),
+            user_device.clone(),
             // Private LAN NIC for inter-VM communication
-            "-netdev",
-            &lan_netdev,
-            "-device",
-            &lan_device,
+            "-netdev".into(),
+            lan_netdev.clone(),
+            "-device".into(),
+            lan_device.clone(),
             // Disk and control
-            "-drive",
-            &drive_config,
-            "-display",
-            "none",
-            "-qmp",
-            &qmp_config,
+            "-drive".into(),
+            drive_config.clone(),
+            "-display".into(),
+            "none".into(),
+            "-qmp".into(),
+            qmp_config.clone(),
         ];
 
         // Add acceleration args if available
-        for a in &self.qemu_config.accel_args {
-            qemu_args.push(a);
-        }
+        qemu_args.extend(self.qemu_config.accel_args.clone());
 
         // Create command running QEMU directly
         let mut cmd = Command::new(&self.qemu_config.binary);
-        cmd.args(qemu_args);
+        cmd.args(&qemu_args);
 
         // Add cloud-init ISO drive if provided
         if let Some(cloud_init_dir) = cloud_init_dir {
@@ -404,11 +525,15 @@ impl Vm {
             .spawn()
             .context(FAILED_TO_START_QEMU)?;
 
-        // Write PID file ourselves since we're not using -daemonize
+        // Write PID file ourselves since we're not using -daemonize (atomic write)
         let pid = child.id().unwrap();
-        fs::write(&self.pid_file, pid.to_string())
+        let tmp_pid = self.pid_file.with_extension("pid.tmp");
+        fs::write(&tmp_pid, pid.to_string())
             .await
-            .context("Failed to write PID file")?;
+            .context("Failed to write temporary PID file")?;
+        tokio::fs::rename(&tmp_pid, &self.pid_file)
+            .await
+            .context("Failed to atomically persist PID file")?;
 
         // Store the process handle
         self.process = Some(child);
@@ -504,13 +629,15 @@ impl Vm {
             log_file: self.log_file.to_string_lossy().into_owned(),
             created_at: Utc::now(),
             network: self.network.clone(),
+            cpus: self.cpus,
+            memory_mb: self.memory_mb,
         };
 
         let state_json = serde_json::to_string_pretty(&state).context(FAILED_TO_SERIALIZE_STATE)?;
 
         fs::write(&self.state_file, state_json)
             .await
-            .with_context(|| format!("{}: {}", FAILED_TO_WRITE_STATE, self.state_file.display()))?;
+            .with_context(|| format!("{FAILED_TO_WRITE_STATE}: {}", self.state_file.display()))?;
 
         Ok(())
     }
@@ -543,7 +670,7 @@ impl Vm {
         // Convert to qcow2
         let qcow2_path = image_path.with_extension("qcow2");
 
-        println!("Converting {} image to qcow2 format...", format);
+        tracing::info!("Converting {} image to qcow2 format...", format);
         let convert_status = Command::new("qemu-img")
             .args(["convert", "-f", format, "-O", "qcow2"])
             .arg(image_path)
@@ -563,7 +690,7 @@ impl Vm {
             bail!("Failed to convert image to qcow2");
         }
 
-        println!("Image converted successfully");
+        tracing::info!("Image converted successfully");
         Ok(qcow2_path)
     }
 
@@ -586,15 +713,13 @@ impl Vm {
 
             if self.qmp_socket.exists() {
                 // Use timeout wrapper for the connection attempt
-                match timeout(CONNECTION_TIMEOUT, UnixStream::connect(&self.qmp_socket)).await {
-                    Ok(Ok(_stream)) => {
-                        tracing::info!("QMP socket ready after {} attempts", attempt);
-                        return Ok(());
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        // Connection failed or timed out, continue to next attempt
-                    }
+                if let Ok(Ok(_stream)) =
+                    timeout(CONNECTION_TIMEOUT, UnixStream::connect(&self.qmp_socket)).await
+                {
+                    tracing::info!("QMP socket ready after {} attempts", attempt);
+                    return Ok(());
                 }
+                // Connection failed or timed out, continue to next attempt
             }
 
             // Exponential backoff with cap: min(250ms * attempt, 1000ms)
@@ -611,10 +736,14 @@ impl Vm {
     }
 
     #[instrument(skip(self))]
+    /// Stop the VM gracefully via QMP, falling back to kill by PID.
+    ///
+    /// # Errors
+    /// Returns an error if process operations fail.
     pub async fn stop(&mut self) -> Result<()> {
         // Try graceful shutdown via QMP first
         if self.qmp_socket.exists() && self.try_graceful_shutdown().await.is_ok() {
-            println!("VM {} shut down gracefully", self.name);
+            tracing::info!("VM {} shut down gracefully", self.name);
             self.cleanup_files().await?;
             return Ok(());
         }
@@ -626,7 +755,7 @@ impl Vm {
                 .arg(pid.to_string())
                 .status()
                 .await
-                .with_context(|| format!("Failed to execute kill command for PID {}", pid))?;
+                .with_context(|| format!("Failed to execute kill command for PID {pid}"))?;
 
             if status.success() {
                 tracing::warn!("VM {} force-stopped by PID {}", self.name, pid);
@@ -640,6 +769,10 @@ impl Vm {
     }
 
     #[instrument(skip(self))]
+    /// Query the VM status using PID and QMP.
+    ///
+    /// # Errors
+    /// Returns an error if the PID check or QMP call fails unexpectedly.
     pub async fn status(&self) -> Result<VmStatus> {
         // First check if PID file exists and process is running
         match self.read_pid().await {
@@ -649,7 +782,7 @@ impl Vm {
                     .args(["-0", &pid.to_string()]) // Signal 0 just checks if process exists
                     .status()
                     .await
-                    .with_context(|| format!("Failed to check process status for PID {}", pid))?;
+                    .with_context(|| format!("Failed to check process status for PID {pid}"))?;
 
                 if !status.success() {
                     return Ok(VmStatus::Stopped);
@@ -666,7 +799,7 @@ impl Vm {
         match self.query_qmp_status().await {
             Ok(status) => Ok(status),
             Err(e) => {
-                eprintln!("QMP status query failed for VM {}: {}", self.name, e);
+                tracing::warn!("QMP status query failed for VM {}: {}", self.name, e);
                 Ok(VmStatus::Unknown) // Process exists but can't query QMP
             }
         }
@@ -730,6 +863,10 @@ impl Vm {
 
 impl Vm {
     #[instrument(skip(self))]
+    /// Stop the VM (if running) and remove its data.
+    ///
+    /// # Errors
+    /// Returns an error if stopping or removing files fails.
     pub async fn cleanup(&mut self) -> Result<()> {
         // Full cleanup - stop VM and remove all files including data
         self.stop().await?;
@@ -739,7 +876,7 @@ impl Vm {
             fs::remove_file(&self.disk_path).await.with_context(|| {
                 format!("Failed to remove disk image: {}", self.disk_path.display())
             })?;
-            println!("Removed disk image for VM {}", self.name);
+            tracing::info!("Removed disk image for VM {}", self.name);
         }
 
         Ok(())
@@ -780,7 +917,7 @@ impl Drop for Vm {
             let pid_info = std::fs::read_to_string(&self.pid_file)
                 .ok()
                 .and_then(|content| content.trim().parse::<u32>().ok())
-                .map(|pid| format!(" (PID: {})", pid))
+                .map(|pid| format!(" (PID: {pid})"))
                 .unwrap_or_default();
 
             tracing::warn!("VM '{}' may still be running{}", self.name, pid_info);

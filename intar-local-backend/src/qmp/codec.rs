@@ -8,7 +8,8 @@ use tokio_util::codec::{Decoder, Encoder};
 pub struct QmpCodec;
 
 impl QmpCodec {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -44,7 +45,7 @@ impl Decoder for QmpCodec {
                     let context = String::from_utf8_lossy(json_bytes);
                     Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Failed to parse JSON: {} | Content: {}", e, context),
+                        format!("Failed to parse JSON: {e} | Content: {context}"),
                     ))
                 }
             }
@@ -71,5 +72,31 @@ impl Encoder<Value> for QmpCodec {
         buf.put_u8(b'\n');
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::io::Cursor;
+    use tokio_util::codec::FramedRead;
+
+    #[tokio::test]
+    async fn decode_single_line_json() {
+        let data = b"{\"hello\":\"world\"}\n".to_vec();
+        let cursor = Cursor::new(data);
+        let mut framed = FramedRead::new(cursor, QmpCodec::new());
+        let item = framed.next().await.unwrap().unwrap();
+        assert_eq!(item["hello"], "world");
+    }
+
+    #[test]
+    fn encode_appends_newline() {
+        let mut codec = QmpCodec::new();
+        let mut buf = BytesMut::new();
+        let value = serde_json::json!({"k":"v"});
+        codec.encode(value, &mut buf).unwrap();
+        assert!(buf.ends_with(b"\n"));
     }
 }

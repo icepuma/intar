@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use tokio::fs;
 use uuid::Uuid;
@@ -20,7 +21,9 @@ pub struct CloudInitConfig {
 }
 
 impl CloudInitConfig {
-    pub fn new(
+    /// Create a new cloud-init config helper for a VM.
+    #[must_use]
+    pub const fn new(
         scenario_name: String,
         vm_name: String,
         dirs: IntarDirs,
@@ -41,6 +44,8 @@ impl CloudInitConfig {
     }
 
     /// Get the directory where cloud-init files will be stored for this VM
+    /// Directory where cloud-init seed files are stored for this VM.
+    #[must_use]
     pub fn get_cloud_init_dir(&self) -> PathBuf {
         self.dirs
             .data_vm_dir(&self.scenario_name, &self.vm_name)
@@ -48,6 +53,8 @@ impl CloudInitConfig {
     }
 
     /// Generate MAC addresses for the VM's network interfaces
+    /// Generate stable MAC addresses for both NICs.
+    #[must_use]
     pub fn generate_mac_addresses(&self) -> (String, String) {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -83,6 +90,8 @@ impl CloudInitConfig {
     }
 
     /// Generate the user-data file content
+    /// Generate cloud-init user-data.
+    #[must_use]
     pub fn generate_user_data(&self) -> String {
         let hostname = format!("{}-{}", self.vm_name, self.scenario_name);
 
@@ -136,19 +145,17 @@ final_message: "Cloud-init setup complete for {hostname}"
         all.sort();
 
         let mut entries = String::new();
-        entries.push_str(&format!(
-            "# intar hosts (scenario {})\n",
-            self.scenario_name
-        ));
+        let _ = writeln!(entries, "# intar hosts (scenario {})", self.scenario_name);
 
         for (idx, name) in all.iter().enumerate() {
-            let ip = calc_lan_ip(self.scenario_id, idx as u8);
+            let idx_u8 = u8::try_from(idx).unwrap_or(u8::MAX);
+            let ip = calc_lan_ip(self.scenario_id, idx_u8);
             // Provide multiple aliases: short vm name, vm-scenario, vm.scenario
-            let line = format!(
-                "{} {} {}-{} {}.{}\n",
+            let _ = writeln!(
+                entries,
+                "{} {} {}-{} {}.{}",
                 ip, name, name, self.scenario_name, name, self.scenario_name
             );
-            entries.push_str(&line);
         }
 
         // Use write_files to stage a hosts fragment and runcmd to append and mask slow services
@@ -166,25 +173,22 @@ runcmd:
   - systemctl disable --now apt-daily-upgrade.service apt-daily-upgrade.timer || true
   - systemctl disable --now motd-news.service motd-news.timer || true
 "#,
-            entries = entries.replace("\n", "\n      ")
+            entries = entries.replace('\n', "\n      ")
         )
     }
 
     /// Generate the meta-data file content
+    /// Generate cloud-init meta-data.
+    #[must_use]
     pub fn generate_meta_data(&self) -> String {
         let instance_id = Uuid::new_v4();
         let hostname = format!("{}-{}", self.vm_name, self.scenario_name);
-
-        format!(
-            r#"instance-id: {instance_id}
-local-hostname: {hostname}
-"#,
-            instance_id = instance_id,
-            hostname = hostname,
-        )
+        format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n")
     }
 
     /// Generate the network-config file content for rootless dual-NIC setup
+    /// Generate netplan YAML for the two NICs.
+    #[must_use]
     pub fn generate_network_config(&self) -> String {
         let (eth0_mac, eth1_mac) = self.generate_mac_addresses();
 
@@ -211,14 +215,15 @@ ethernets:
     dhcp4: false
     dhcp6: false
     optional: false
-"#,
-            eth0_mac = eth0_mac,
-            eth1_mac = eth1_mac,
-            lan_ip = lan_ip,
+"#
         )
     }
 
     /// Create all cloud-init configuration files
+    /// Create cloud-init files on disk.
+    ///
+    /// # Errors
+    /// Returns an error if any file write fails.
     pub async fn create_config_files(&self) -> Result<PathBuf> {
         let cloud_init_dir = self.get_cloud_init_dir();
 
@@ -259,12 +264,11 @@ ethernets:
         Ok(cloud_init_dir)
     }
 
-    /// Get the network subnet for this scenario (socket_vmnet shared network)
-    pub fn get_scenario_subnet(&self) -> String {
-        "192.168.105.0/24".to_string()
-    }
-
     /// Clean up cloud-init configuration files
+    /// Remove cloud-init files for this VM.
+    ///
+    /// # Errors
+    /// Returns an error if removal fails unexpectedly.
     pub async fn cleanup(&self) -> Result<()> {
         let cloud_init_dir = self.get_cloud_init_dir();
 
@@ -281,8 +285,12 @@ ethernets:
     }
 }
 
-/// Helper function to calculate scenario ID from scenario name
-/// This ensures consistent network separation between scenarios
+/// Calculate a stable scenario id from its name.
+///
+/// Ensures consistent network separation between scenarios.
+#[must_use]
+/// # Panics
+/// Panics only if integer conversion fails, which cannot occur here due to modulo reduction.
 pub fn calculate_scenario_id(scenario_name: &str) -> u8 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -292,7 +300,58 @@ pub fn calculate_scenario_id(scenario_name: &str) -> u8 {
 
     // Use the hash to generate a scenario ID between 1 and 254
     // (avoiding 0 and 255 for network reasons)
-    ((hasher.finish() % 254) + 1) as u8
+    u8::try_from((hasher.finish() % 254) + 1).expect("hash modulo 254 + 1 always fits in u8")
 }
 
-// tests removed
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_config_contains_expected_lan_ip() {
+        let dirs = IntarDirs::new().expect("dirs");
+        let cfg = CloudInitConfig::new(
+            "ScenarioX".into(),
+            "vm1".into(),
+            dirs,
+            "ssh-rsa AAA...".into(),
+            0,
+            42,
+            vec!["vm1".into(), "vm2".into()],
+        );
+        let net = cfg.generate_network_config();
+        assert!(net.contains("172.30.42.10/24"), "net={net}");
+    }
+
+    #[test]
+    fn user_data_contains_hosts_and_sshkey() {
+        let dirs = IntarDirs::new().expect("dirs");
+        let cfg = CloudInitConfig::new(
+            "MultiDemo".into(),
+            "web".into(),
+            dirs,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA".into(),
+            0,
+            10,
+            vec!["web".into(), "db".into(), "cache".into()],
+        );
+        let user = cfg.generate_user_data();
+        assert!(user.starts_with("#cloud-config"));
+        assert!(user.contains("ssh_authorized_keys"));
+        // hosts file line for db should be present
+        assert!(
+            user.contains("db db-MultiDemo db.MultiDemo"),
+            "user-data={user}",
+        );
+    }
+
+    #[test]
+    fn scenario_id_is_in_range() {
+        for name in &["a", "b", "MultiDemo", "x"] {
+            let id = calculate_scenario_id(name);
+            assert!((1..=254).contains(&id));
+        }
+        // Determinism
+        assert_eq!(calculate_scenario_id("same"), calculate_scenario_id("same"));
+    }
+}

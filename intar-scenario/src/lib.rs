@@ -7,6 +7,10 @@ pub use models::*;
 #[folder = "../scenarios/"]
 pub struct EmbeddedScenarios;
 
+/// Reads an embedded scenario by filename.
+///
+/// # Errors
+/// Returns an error if the embedded file is not found or cannot be parsed.
 pub fn read_embedded_scenario(filename: &str) -> anyhow::Result<Scenario> {
     match EmbeddedScenarios::get(filename) {
         Some(file) => {
@@ -21,6 +25,7 @@ pub fn read_embedded_scenario(filename: &str) -> anyhow::Result<Scenario> {
     }
 }
 
+#[must_use]
 pub fn list_embedded_scenarios() -> Vec<String> {
     EmbeddedScenarios::iter()
         .map(|path| path.to_string())

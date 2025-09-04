@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use intar_local_backend::{Backend, BackendVm, LocalBackend, VmStatus};
 
+/// Orchestrates backend operations for a scenario (prepare, start/stop, status, cleanup).
 pub struct ScenarioRunner {
     pub scenario: Scenario,
     pub vms: HashMap<String, Box<dyn BackendVm>>,
@@ -12,6 +13,10 @@ pub struct ScenarioRunner {
 }
 
 impl ScenarioRunner {
+    /// Create a new runner for a scenario.
+    ///
+    /// # Errors
+    /// Returns an error if backend initialization fails.
     pub fn new(scenario: Scenario) -> Result<Self> {
         let backend = Box::new(LocalBackend::new()?);
 
@@ -22,6 +27,17 @@ impl ScenarioRunner {
         })
     }
 
+    /// Prepare the scenario (dirs, keys, images) and instantiate VMs.
+    ///
+    /// # Errors
+    /// Returns an error if the backend fails to prepare or VMs fail to be created.
+    /// Prepare the scenario (directories, keys, images) and create VMs.
+    ///
+    /// # Panics
+    /// Panics if a VM config cannot be found for an enumerated VM name.
+    ///
+    /// # Errors
+    /// Returns an error if backend preparation or VM creation fails.
     pub async fn prepare(&mut self) -> Result<()> {
         // Let the backend handle preparation
         self.backend
@@ -52,6 +68,10 @@ impl ScenarioRunner {
         Ok(())
     }
 
+    /// Start all VMs concurrently and wait for successful startup.
+    ///
+    /// # Errors
+    /// Returns an error if any VM fails to start.
     pub async fn start_all(&mut self) -> Result<()> {
         if self.vms.is_empty() {
             return Ok(());
@@ -71,11 +91,11 @@ impl ScenarioRunner {
                 tracing::info!("Starting VM: {}", name);
                 vm.start()
                     .await
-                    .with_context(|| format!("Failed to start VM: {}", name))?;
+                    .with_context(|| format!("Failed to start VM: {name}"))?;
                 let ssh_info = vm
                     .ssh_info()
                     .await
-                    .with_context(|| format!("Failed to get SSH info for VM: {}", name))?;
+                    .with_context(|| format!("Failed to get SSH info for VM: {name}"))?;
                 tracing::info!(
                     "VM {} started successfully with SSH access on port {}",
                     name,
@@ -93,6 +113,10 @@ impl ScenarioRunner {
         Ok(())
     }
 
+    /// Stop all VMs concurrently.
+    ///
+    /// # Errors
+    /// Returns an error if any VM fails to stop.
     pub async fn stop_all(&mut self) -> Result<()> {
         if self.vms.is_empty() {
             return Ok(());
@@ -110,7 +134,7 @@ impl ScenarioRunner {
                     tracing::info!("Stopping VM: {}", name);
                     vm.stop()
                         .await
-                        .with_context(|| format!("Failed to stop VM: {}", name))?;
+                        .with_context(|| format!("Failed to stop VM: {name}"))?;
                     tracing::info!("VM {} stopped successfully", name);
                     Ok::<(), anyhow::Error>(())
                 }
@@ -124,10 +148,18 @@ impl ScenarioRunner {
         Ok(())
     }
 
+    /// Query the status of all VMs in the scenario.
+    ///
+    /// # Errors
+    /// Returns an error if the backend fails to load VM state or query status.
     pub async fn status_all(&self) -> Result<HashMap<String, VmStatus>> {
         self.backend.get_scenario_status(&self.scenario.name).await
     }
 
+    /// Cleanup all resources associated with the scenario (destructive).
+    ///
+    /// # Errors
+    /// Returns an error if backend cleanup fails.
     pub async fn cleanup_all(&mut self) -> Result<()> {
         self.backend
             .cleanup_scenario(&self.scenario)
@@ -140,7 +172,10 @@ impl ScenarioRunner {
         Ok(())
     }
 
-    /// Load an existing scenario from state
+    /// Load an existing scenario runner from persisted state.
+    ///
+    /// # Errors
+    /// Returns an error if backend loading of VMs from state fails.
     pub async fn from_state(scenario: Scenario) -> Result<Self> {
         let mut runner = Self::new(scenario)?;
 

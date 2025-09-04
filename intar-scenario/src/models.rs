@@ -8,8 +8,49 @@ pub struct Scenario {
     #[serde(default)]
     pub description: String,
     pub image: String,
+    /// Optional SHA256 checksum of the image for integrity verification
+    #[serde(default)]
+    pub sha256: Option<String>,
     #[serde(default)]
     pub vm: HashMap<String, VmConfig>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_minimal_scenario_defaults() {
+        let hcl = r#"
+            name = "Demo"
+            image = "https://example.com/image.qcow2"
+            vm "vm1" {}
+        "#;
+        let s: Scenario = hcl::from_str(hcl).expect("parse");
+        assert_eq!(s.name, "Demo");
+        assert_eq!(s.sha256, None);
+        let cfg = s.vm.get("vm1").unwrap();
+        assert_eq!(cfg.cpus, 2);
+        assert_eq!(cfg.memory, 2048);
+    }
+
+    #[test]
+    fn parse_with_overrides_and_sha256() {
+        let hcl = r#"
+            name = "X"
+            image = "https://example.com/x.img"
+            sha256 = "deadbeef"
+            vm "a" {
+              cpus = 4
+              memory = 4096
+            }
+        "#;
+        let s: Scenario = hcl::from_str(hcl).expect("parse");
+        assert_eq!(s.sha256.as_deref(), Some("deadbeef"));
+        let cfg = s.vm.get("a").unwrap();
+        assert_eq!(cfg.cpus, 4);
+        assert_eq!(cfg.memory, 4096);
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -56,14 +97,14 @@ pub struct NetworkRoute {
 }
 
 // Default values
-fn default_cpus() -> u8 {
+const fn default_cpus() -> u8 {
     2
 }
 
-fn default_memory() -> u32 {
+const fn default_memory() -> u32 {
     2048
 }
 
-fn default_route_metric() -> u32 {
+const fn default_route_metric() -> u32 {
     100
 }

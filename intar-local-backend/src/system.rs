@@ -14,6 +14,9 @@ const FIRMWARE_PATHS: &[&str] = &[
     // Linux (common distributions)
     "/usr/share/AAVMF/AAVMF_CODE.fd",
     "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+    "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+    "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
+    "/usr/share/edk2-ovmf/aarch64/OVMF_CODE.fd",
     "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
     "/usr/share/qemu/qemu_efi.fd",
     "/usr/share/qemu/edk2-arm-code.fd",
@@ -38,6 +41,10 @@ static DETECTED_QEMU_CONFIG: OnceLock<Result<QemuConfig, String>> = OnceLock::ne
 
 impl QemuConfig {
     #[inline]
+    /// Detect QEMU configuration for the current host.
+    ///
+    /// # Errors
+    /// Returns an error if the QEMU binary cannot be found or the architecture is unsupported.
     pub fn detect() -> Result<Self> {
         // Use cached result if available
         DETECTED_QEMU_CONFIG
@@ -49,17 +56,21 @@ impl QemuConfig {
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
+    /// Build a QEMU configuration for the given architecture.
+    ///
+    /// # Errors
+    /// Returns an error if binaries are not found or architecture is unsupported.
     pub fn for_architecture(arch: &str) -> Result<Self> {
         let os = std::env::consts::OS;
         let mut cfg = match arch {
-            "x86_64" => QemuConfig {
+            "x86_64" => Self {
                 binary: Self::find_qemu_binary("qemu-system-x86_64")?,
                 machine: X86_64_MACHINE.to_string(),
                 cpu: MAX_CPU.to_string(),
                 needs_uefi: false,
                 accel_args: Vec::new(),
             },
-            "aarch64" => QemuConfig {
+            "aarch64" => Self {
                 binary: Self::find_qemu_binary("qemu-system-aarch64")?,
                 machine: ARM64_MACHINE.to_string(),
                 cpu: MAX_CPU.to_string(),
@@ -84,9 +95,13 @@ impl QemuConfig {
         Ok(cfg)
     }
 
+    /// Find a QEMU system binary in PATH.
+    ///
+    /// # Errors
+    /// Returns an error if the binary is not present in PATH.
     fn find_qemu_binary(binary_name: &str) -> Result<String> {
         which(binary_name)
-            .with_context(|| format!("{} not found in PATH", binary_name))?
+            .with_context(|| format!("{binary_name} not found in PATH"))?
             .to_string_lossy()
             .to_string()
             .pipe(Ok)
