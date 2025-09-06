@@ -1,0 +1,29 @@
+[package]
+name = "intar-agent"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Intar in-VM agent that collects system metrics and pushes OTLP/HTTP"
+readme = "README.md"
+keywords = ["intar", "agent", "metrics", "otlp", "prometheus"]
+categories = ["command-line-utilities", "monitoring"]
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["reqwest-client"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+glob = { workspace = true }
+
+[features]
+default = []
+dev-stdout = []

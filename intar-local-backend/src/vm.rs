@@ -11,7 +11,9 @@ use tokio::net::UnixStream;
 use tokio::process::Command;
 
 use crate::cloud_init::{CloudInitConfig, CloudInitSpec, calculate_scenario_id};
-use crate::constants::{HOSTFWD_BASE_PORT, hub_port, lan_ip as calc_lan_ip};
+use crate::constants::{
+    HOSTFWD_BASE_PORT, hub_port, lan_ip as calc_lan_ip, metrics_port as calc_metrics_port,
+};
 use crate::dirs::IntarDirs;
 use crate::system::QemuConfig;
 use intar_scenario::Manipulation;
@@ -58,7 +60,7 @@ const fn default_cpus_state() -> u8 {
     1
 }
 const fn default_memory_state() -> u32 {
-    1024
+    512
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +85,9 @@ pub struct VmNetworkState {
 
     /// TCP port used for the per-scenario socket LAN
     pub lan_port: u16,
+    /// Host port for per-VM metrics forwarding
+    #[serde(default)]
+    pub metrics_port: u16,
 }
 
 pub struct Vm {
@@ -135,6 +140,11 @@ pub struct VmCreateSpec {
 }
 
 impl Vm {
+    fn sanitize_env(cmd: &mut Command) {
+        // Avoid passing huge env to child processes (ARG_MAX issues)
+        cmd.env_remove("INTAR_AGENT_BUNDLE_GZB64");
+        cmd.env_remove("INTAR_AGENT_SHA256");
+    }
     /// Create a VM instance with its index within the scenario.
     ///
     /// # Errors
@@ -192,12 +202,19 @@ impl Vm {
             all_vm_names: vec![], // VM names not available here
             manipulation_packages: vec![],
             manipulation_scripts: vec![],
+            agent_bundle_gz_b64: None,
+            agent_sha256_hex: None,
+            agent_otlp_endpoint: None,
+            agent_metadata_url: None,
+            agent_from_iso: false,
+            agent_iso_label: None,
         });
         let (eth0_mac, eth1_mac) = cloud_init.generate_mac_addresses();
 
         // SSH port allocation and LAN details via shared constants/helpers
         let ssh_port = HOSTFWD_BASE_PORT + u16::from(vm_index);
         let lan_port: u16 = hub_port(scenario_id);
+        let metrics_port = calc_metrics_port(scenario_id, vm_index);
         let lan_ip = calc_lan_ip(scenario_id, vm_index);
 
         VmNetworkState {
@@ -208,6 +225,7 @@ impl Vm {
             vm_index,
             lan_ip,
             lan_port,
+            metrics_port,
         }
     }
 
@@ -281,6 +299,7 @@ impl Vm {
             .filter_map(|m| m.script.clone())
             .collect();
 
+        let from_iso = std::env::var("INTAR_AGENT_FROM_ISO").ok().as_deref() == Some("1");
         let cloud_init = CloudInitConfig::new(CloudInitSpec {
             scenario_name: self.scenario_name.clone(),
             vm_name: self.name.clone(),
@@ -291,6 +310,12 @@ impl Vm {
             all_vm_names: self.all_vm_names.clone(),
             manipulation_packages: merged_packages,
             manipulation_scripts: scripts,
+            agent_bundle_gz_b64: std::env::var("INTAR_AGENT_BUNDLE_GZB64").ok(),
+            agent_sha256_hex: std::env::var("INTAR_AGENT_SHA256").ok(),
+            agent_otlp_endpoint: std::env::var("INTAR_AGENT_OTLP_ENDPOINT").ok(),
+            agent_metadata_url: std::env::var("INTAR_METADATA_URL").ok(),
+            agent_from_iso: from_iso,
+            agent_iso_label: Some("INTARAGENT".to_string()),
         });
 
         cloud_init.create_config_files().await
@@ -300,10 +325,11 @@ impl Vm {
     #[must_use]
     pub fn get_network_info(&self) -> String {
         format!(
-            "SSH: ssh -i <key> -p {} intar@127.0.0.1\nPrivate LAN IP: {} ({})",
+            "SSH: ssh -i <key> -p {} intar@127.0.0.1\nPrivate LAN IP: {} ({})\nMetrics: http://127.0.0.1:{}/metrics",
             self.network.ssh_port,
             self.network.lan_ip,
-            crate::constants::lan_subnet(self.network.scenario_id)
+            crate::constants::lan_subnet(self.network.scenario_id),
+            self.network.metrics_port
         )
     }
 
@@ -335,6 +361,187 @@ impl Vm {
         Ok(())
     }
 
+    async fn add_agent_iso_drive(&self, cmd: &mut Command) -> Result<()> {
+        use std::path::PathBuf;
+        let agent_path = match std::env::var("INTAR_AGENT_PATH") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => return Ok(()),
+        };
+        if !agent_path.exists() {
+            anyhow::bail!("Agent binary not found: {}", agent_path.display());
+        }
+        let iso_path = self
+            .dirs
+            .data_vm_dir(&self.scenario_name, &self.name)
+            .join("agent.iso");
+        if iso_path.exists() {
+            tokio::fs::remove_file(&iso_path).await.with_context(|| {
+                format!(
+                    "Failed to remove existing agent ISO: {}",
+                    iso_path.display()
+                )
+            })?;
+        }
+
+        #[cfg(target_os = "macos")]
+        self.create_iso_macos(&agent_path, &iso_path, "INTARAGENT")
+            .await?;
+        #[cfg(not(target_os = "macos"))]
+        self.create_iso_unix(&agent_path, &iso_path, "INTARAGENT")
+            .await?;
+
+        cmd.args([
+            "-drive",
+            &format!("file={},media=cdrom,readonly=on", iso_path.display()),
+        ]);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn create_iso_macos(
+        &self,
+        src_path: &std::path::Path,
+        iso_path: &std::path::Path,
+        label: &str,
+    ) -> Result<()> {
+        // TokioCommand is imported now at the start to avoid items-after-statements
+        use tokio::process::Command as TokioCommand;
+        // If src_path is a directory, use it directly. Otherwise, stage the single file.
+        let (source_root, _temp_guard);
+        if src_path.is_dir() {
+            source_root = src_path.to_path_buf();
+            _temp_guard = None::<tempfile::TempDir>;
+        } else {
+            let stage_dir = tempfile::tempdir().context("Failed to create temp dir for ISO")?;
+            let staged = stage_dir.path().join(
+                src_path
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("intar-agent")),
+            );
+            tokio::fs::copy(src_path, &staged)
+                .await
+                .with_context(|| format!("Failed to stage file for ISO: {}", src_path.display()))?;
+            source_root = stage_dir.path().to_path_buf();
+            _temp_guard = Some(stage_dir);
+        }
+        let mut cmd = TokioCommand::new("hdiutil");
+        Self::sanitize_env(&mut cmd);
+        let output = cmd
+            .args([
+                "makehybrid",
+                "-iso",
+                "-joliet",
+                "-default-volume-name",
+                label,
+                "-o",
+                &iso_path.to_string_lossy(),
+                &source_root.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .context("Failed to run hdiutil to create ISO")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to create ISO: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn create_iso_unix(
+        &self,
+        src_path: &std::path::Path,
+        iso_path: &std::path::Path,
+        label: &str,
+    ) -> Result<()> {
+        use tokio::process::Command as TokioCommand;
+        use which::which;
+        // Use src directory directly if it's a directory; otherwise, stage the file
+        let (dir_root, _temp_guard);
+        if src_path.is_dir() {
+            dir_root = src_path.to_path_buf();
+            _temp_guard = None::<tempfile::TempDir>;
+        } else {
+            let stage_dir = tempfile::tempdir().context("Failed to create temp dir for ISO")?;
+            let staged = stage_dir.path().join(
+                src_path
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("intar-agent")),
+            );
+            tokio::fs::copy(src_path, &staged)
+                .await
+                .with_context(|| format!("Failed to stage file for ISO: {}", src_path.display()))?;
+            dir_root = stage_dir.path().to_path_buf();
+            _temp_guard = Some(stage_dir);
+        }
+        let iso_str = iso_path.to_string_lossy().to_string();
+        let dir_str = dir_root.to_string_lossy().to_string();
+        let (bin, args): (String, Vec<String>) = if which("genisoimage").is_ok() {
+            (
+                "genisoimage".into(),
+                vec![
+                    "-output".into(),
+                    iso_str.clone(),
+                    "-volid".into(),
+                    label.into(),
+                    "-joliet".into(),
+                    "-rock".into(),
+                    dir_str.clone(),
+                ],
+            )
+        } else if which("mkisofs").is_ok() {
+            (
+                "mkisofs".into(),
+                vec![
+                    "-o".into(),
+                    iso_str.clone(),
+                    "-V".into(),
+                    label.into(),
+                    "-J".into(),
+                    "-r".into(),
+                    dir_str.clone(),
+                ],
+            )
+        } else if which("xorriso").is_ok() {
+            (
+                "xorriso".into(),
+                vec![
+                    "-as".into(),
+                    "mkisofs".into(),
+                    "-V".into(),
+                    label.into(),
+                    "-J".into(),
+                    "-l".into(),
+                    "-r".into(),
+                    "-o".into(),
+                    iso_str.clone(),
+                    dir_str.clone(),
+                ],
+            )
+        } else {
+            anyhow::bail!(
+                "No ISO creation tool found. Install one of: genisoimage, mkisofs, xorriso"
+            );
+        };
+        let mut cmd = TokioCommand::new(&bin);
+        Self::sanitize_env(&mut cmd);
+        let output = cmd
+            .args(&args)
+            .output()
+            .await
+            .with_context(|| format!("Failed to run {bin} to create ISO"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to create ISO using {}: {}",
+                bin,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
     /// Create a cloud-init ISO for the given seed directory.
     ///
     /// # Errors
@@ -343,7 +550,6 @@ impl Vm {
         &self,
         cloud_init_dir: &std::path::Path,
     ) -> Result<std::path::PathBuf> {
-        use tokio::process::Command as TokioCommand;
         // Create ISO path
         let iso_path = cloud_init_dir.parent().unwrap().join("cloud-init.iso");
         if iso_path.exists() {
@@ -353,93 +559,11 @@ impl Vm {
         }
 
         #[cfg(target_os = "macos")]
-        {
-            let output = TokioCommand::new("hdiutil")
-                .args([
-                    "makehybrid",
-                    "-iso",
-                    "-joliet",
-                    "-default-volume-name",
-                    "cidata",
-                    "-o",
-                    &iso_path.to_string_lossy(),
-                    &cloud_init_dir.to_string_lossy(),
-                ])
-                .output()
-                .await
-                .context("Failed to run hdiutil to create cloud-init ISO")?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "Failed to create cloud-init ISO: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
+        self.create_iso_macos(cloud_init_dir, &iso_path, "cidata")
+            .await?;
         #[cfg(not(target_os = "macos"))]
-        {
-            use which::which;
-            let iso_str = iso_path.to_string_lossy().to_string();
-            let dir_str = cloud_init_dir.to_string_lossy().to_string();
-            let (bin, args): (String, Vec<String>) = if which("genisoimage").is_ok() {
-                (
-                    "genisoimage".into(),
-                    vec![
-                        "-output".into(),
-                        iso_str.clone(),
-                        "-volid".into(),
-                        "cidata".into(),
-                        "-joliet".into(),
-                        "-rock".into(),
-                        dir_str.clone(),
-                    ],
-                )
-            } else if which("mkisofs").is_ok() {
-                (
-                    "mkisofs".into(),
-                    vec![
-                        "-o".into(),
-                        iso_str.clone(),
-                        "-V".into(),
-                        "cidata".into(),
-                        "-J".into(),
-                        "-r".into(),
-                        dir_str.clone(),
-                    ],
-                )
-            } else if which("xorriso").is_ok() {
-                (
-                    "xorriso".into(),
-                    vec![
-                        "-as".into(),
-                        "mkisofs".into(),
-                        "-V".into(),
-                        "cidata".into(),
-                        "-J".into(),
-                        "-l".into(),
-                        "-r".into(),
-                        "-o".into(),
-                        iso_str.clone(),
-                        dir_str.clone(),
-                    ],
-                )
-            } else {
-                anyhow::bail!(
-                    "No ISO creation tool found. Install one of: genisoimage, mkisofs, xorriso"
-                );
-            };
-            let output = TokioCommand::new(&bin)
-                .args(&args)
-                .output()
-                .await
-                .with_context(|| format!("Failed to run {bin} to create cloud-init ISO"))?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "Failed to create cloud-init ISO using {}: {}",
-                    bin,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
+        self.create_iso_unix(cloud_init_dir, &iso_path, "cidata")
+            .await?;
         Ok(iso_path)
     }
 
@@ -470,71 +594,23 @@ impl Vm {
         if !self.disk_path.exists() {
             self.create_disk_image().await?;
         }
-
-        // Prepare QEMU arguments for dual-NIC rootless setup
-        // NIC0: user-mode NAT with SSH port forward
-        let user_netdev = format!(
-            "user,id=nat0,hostfwd=tcp:127.0.0.1:{}-:22",
-            self.network.ssh_port
-        );
-        let user_device = format!("virtio-net-pci,netdev=nat0,mac={}", self.network.eth0_mac);
-
-        // NIC1: per-scenario LAN using UDP unicast to a local hub (rootless, N-way)
-        // Each VM sends to 127.0.0.1:lan_port; hub re-broadcasts to all peers
-        let lan_id = "lan0";
-        let lan_netdev = format!(
-            "socket,id={},udp=127.0.0.1:{},localaddr=127.0.0.1:0",
-            lan_id, self.network.lan_port
-        );
-        let lan_device = format!(
-            "virtio-net-pci,netdev={},mac={}",
-            lan_id, self.network.eth1_mac
-        );
-
+        // Prepare network and core QEMU args
+        let (user_netdev, user_device, lan_netdev, lan_device) = self.network_arg_strings();
         let drive_config = format!("file={},if=virtio,format=qcow2", self.disk_path.display());
         let qmp_config = format!("unix:{},server,nowait", self.qmp_socket.display());
-
-        let mut qemu_args: Vec<String> = vec![
-            "-machine".into(),
-            self.qemu_config.machine.clone(),
-            "-cpu".into(),
-            self.qemu_config.cpu.clone(),
-            "-smp".into(),
-            self.cpus.to_string(),
-            "-m".into(),
-            format!("{}M", self.memory_mb),
-            // NAT NIC for SSH and internet access
-            "-netdev".into(),
-            user_netdev.clone(),
-            "-device".into(),
-            user_device.clone(),
-            // Private LAN NIC for inter-VM communication
-            "-netdev".into(),
-            lan_netdev.clone(),
-            "-device".into(),
-            lan_device.clone(),
-            // Disk and control
-            "-drive".into(),
-            drive_config.clone(),
-            "-display".into(),
-            "none".into(),
-            "-qmp".into(),
-            qmp_config.clone(),
-        ];
-
-        // Add acceleration args if available
+        let mut qemu_args = self.base_qemu_args(
+            &drive_config,
+            &qmp_config,
+            (&user_netdev, &user_device, &lan_netdev, &lan_device),
+        );
         qemu_args.extend(self.qemu_config.accel_args.clone());
 
         // Create command running QEMU directly
         let mut cmd = Command::new(&self.qemu_config.binary);
+        Self::sanitize_env(&mut cmd);
         cmd.args(&qemu_args);
-
-        // Add cloud-init ISO drive if provided
-        if let Some(cloud_init_dir) = cloud_init_dir {
-            self.add_cloud_init_drive(&mut cmd, cloud_init_dir)
-                .await
-                .context("Failed to add cloud-init ISO drive")?;
-        }
+        self.configure_optional_drives(&mut cmd, cloud_init_dir)
+            .await?;
 
         // Add UEFI firmware if needed (for ARM64)
         if self.qemu_config.needs_uefi {
@@ -545,42 +621,10 @@ impl Vm {
             }
         }
 
-        tracing::info!("Starting QEMU (rootless dual-NIC)");
-        tracing::info!("NAT: hostfwd 127.0.0.1:{} -> 22", self.network.ssh_port);
-        tracing::info!(
-            "LAN: 172.30.{}.0/24 via UDP hub on 127.0.0.1:{} (localaddr ephemeral)",
-            self.network.scenario_id,
-            self.network.lan_port
-        );
-        tracing::info!("PID file: {}", self.pid_file.display());
-        tracing::info!("QMP socket: {}", self.qmp_socket.display());
-        tracing::info!("Log file: {}", self.log_file.display());
+        self.log_start_info();
 
-        // Create log file for stderr
-        let log_file = std::fs::File::create(&self.log_file).context(FAILED_TO_CREATE_LOG_FILE)?;
-
-        // Start QEMU without daemonization - we manage the process ourselves
-        let child = cmd
-            .stdout(Stdio::null())
-            .stderr(log_file)
-            .spawn()
-            .context(FAILED_TO_START_QEMU)?;
-
-        // Write PID file ourselves since we're not using -daemonize (atomic write)
-        let pid = child.id().unwrap();
-        let tmp_pid = self.pid_file.with_extension("pid.tmp");
-        fs::write(&tmp_pid, pid.to_string())
-            .await
-            .context("Failed to write temporary PID file")?;
-        tokio::fs::rename(&tmp_pid, &self.pid_file)
-            .await
-            .context("Failed to atomically persist PID file")?;
-
-        // Store the process handle
-        self.process = Some(child);
-
-        // Save VM state
-        self.save_state().await?;
+        // Start QEMU and persist state
+        self.spawn_and_record(cmd).await?;
 
         // Verify QMP socket is available
         self.wait_for_qmp_socket().await?;
@@ -589,6 +633,124 @@ impl Vm {
             "VM {} started successfully and running in background",
             self.name
         );
+        Ok(())
+    }
+
+    fn network_arg_strings(&self) -> (String, String, String, String) {
+        // NIC0: user-mode NAT with SSH and metrics port forwards
+        let user_netdev = format!(
+            "user,id=nat0,hostfwd=tcp:127.0.0.1:{}-:22,hostfwd=tcp:127.0.0.1:{}-:9464",
+            self.network.ssh_port, self.network.metrics_port
+        );
+        let user_device = format!("virtio-net-pci,netdev=nat0,mac={}", self.network.eth0_mac);
+
+        // NIC1: per-scenario LAN via UDP hub
+        let lan_id = "lan0";
+        let lan_netdev = format!(
+            "socket,id={},udp=127.0.0.1:{},localaddr=127.0.0.1:0",
+            lan_id, self.network.lan_port
+        );
+        let lan_device = format!(
+            "virtio-net-pci,netdev={},mac={}",
+            lan_id, self.network.eth1_mac
+        );
+        (user_netdev, user_device, lan_netdev, lan_device)
+    }
+
+    fn base_qemu_args(
+        &self,
+        drive_config: &str,
+        qmp_config: &str,
+        net: (&str, &str, &str, &str),
+    ) -> Vec<String> {
+        let (user_netdev, user_device, lan_netdev, lan_device) = net;
+        vec![
+            "-machine".into(),
+            self.qemu_config.machine.clone(),
+            "-cpu".into(),
+            self.qemu_config.cpu.clone(),
+            "-smp".into(),
+            self.cpus.to_string(),
+            "-m".into(),
+            format!("{}M", self.memory_mb),
+            // NAT NIC for SSH and internet access
+            "-netdev".into(),
+            user_netdev.to_string(),
+            "-device".into(),
+            user_device.to_string(),
+            // Private LAN NIC for inter-VM communication
+            "-netdev".into(),
+            lan_netdev.to_string(),
+            "-device".into(),
+            lan_device.to_string(),
+            // Disk and control
+            "-drive".into(),
+            drive_config.to_string(),
+            "-display".into(),
+            "none".into(),
+            "-qmp".into(),
+            qmp_config.to_string(),
+        ]
+    }
+
+    fn log_start_info(&self) {
+        tracing::info!("Starting QEMU (rootless dual-NIC)");
+        tracing::info!("NAT: hostfwd 127.0.0.1:{} -> 22", self.network.ssh_port);
+        tracing::info!(
+            "NAT: hostfwd 127.0.0.1:{} -> 9464 (metrics)",
+            self.network.metrics_port
+        );
+        tracing::info!(
+            "LAN: 172.30.{}.0/24 via UDP hub on 127.0.0.1:{} (localaddr ephemeral)",
+            self.network.scenario_id,
+            self.network.lan_port
+        );
+        tracing::info!("PID file: {}", self.pid_file.display());
+        tracing::info!("QMP socket: {}", self.qmp_socket.display());
+        tracing::info!("Log file: {}", self.log_file.display());
+    }
+
+    async fn configure_optional_drives(
+        &self,
+        cmd: &mut Command,
+        cloud_init_dir: Option<&std::path::Path>,
+    ) -> Result<()> {
+        if let Some(dir) = cloud_init_dir {
+            self.add_cloud_init_drive(cmd, dir)
+                .await
+                .context("Failed to add cloud-init ISO drive")?;
+        }
+        if std::env::var("INTAR_AGENT_FROM_ISO").ok().as_deref() == Some("1") {
+            self.add_agent_iso_drive(cmd)
+                .await
+                .context("Failed to add agent ISO drive")?;
+        }
+        Ok(())
+    }
+
+    async fn persist_pid_atomic(&self, pid: u32) -> Result<()> {
+        let tmp_pid = self.pid_file.with_extension("pid.tmp");
+        fs::write(&tmp_pid, pid.to_string())
+            .await
+            .context("Failed to write temporary PID file")?;
+        tokio::fs::rename(&tmp_pid, &self.pid_file)
+            .await
+            .context("Failed to atomically persist PID file")?;
+        Ok(())
+    }
+
+    async fn spawn_and_record(&mut self, mut cmd: Command) -> Result<()> {
+        // Create log file for stderr
+        let log_file = std::fs::File::create(&self.log_file).context(FAILED_TO_CREATE_LOG_FILE)?;
+        let child = cmd
+            .stdout(Stdio::null())
+            .stderr(log_file)
+            .spawn()
+            .context(FAILED_TO_START_QEMU)?;
+        let pid = child.id().unwrap();
+        self.persist_pid_atomic(pid).await?;
+        self.process = Some(child);
+        self.save_state().await?;
         Ok(())
     }
 
@@ -625,6 +787,7 @@ impl Vm {
     #[instrument(skip(self))]
     async fn create_disk_image(&self) -> Result<()> {
         let mut create_cmd = Command::new("qemu-img");
+        Self::sanitize_env(&mut create_cmd);
 
         if let Some(base_image) = &self.base_image {
             // First, detect and potentially convert the base image
@@ -643,15 +806,30 @@ impl Vm {
                 .arg("10G");
         }
 
-        let status = create_cmd.status().await.with_context(|| {
-            format!(
-                "{} for disk: {}",
-                FAILED_TO_EXECUTE_QEMU_IMG,
-                self.disk_path.display()
-            )
-        })?;
+        // Capture stdout/stderr so qemu-img doesn't print to console
+        let output = create_cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "{} for disk: {}",
+                    FAILED_TO_EXECUTE_QEMU_IMG,
+                    self.disk_path.display()
+                )
+            })?;
 
-        if !status.success() {
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        if !stdout_str.trim().is_empty() {
+            tracing::info!("qemu-img stdout: {}", stdout_str.trim());
+        }
+        if !stderr_str.trim().is_empty() {
+            tracing::info!("qemu-img stderr: {}", stderr_str.trim());
+        }
+
+        if !output.status.success() {
             bail!(FAILED_TO_CREATE_DISK_IMAGE);
         }
 
@@ -685,7 +863,9 @@ impl Vm {
 
     async fn ensure_qcow2_image(&self, image_path: &std::path::Path) -> Result<PathBuf> {
         // Check if image is already qcow2
-        let info_output = Command::new("qemu-img")
+        let mut info_cmd = Command::new("qemu-img");
+        Self::sanitize_env(&mut info_cmd);
+        let info_output = info_cmd
             .args(["info", "--output", "json"])
             .arg(image_path)
             .output()
@@ -712,11 +892,15 @@ impl Vm {
         let qcow2_path = image_path.with_extension("qcow2");
 
         tracing::info!("Converting {} image to qcow2 format...", format);
-        let convert_status = Command::new("qemu-img")
+        let mut convert_cmd = Command::new("qemu-img");
+        Self::sanitize_env(&mut convert_cmd);
+        let convert_output = convert_cmd
             .args(["convert", "-f", format, "-O", "qcow2"])
             .arg(image_path)
             .arg(&qcow2_path)
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
             .await
             .with_context(|| {
                 format!(
@@ -727,7 +911,16 @@ impl Vm {
                 )
             })?;
 
-        if !convert_status.success() {
+        let c_stdout = String::from_utf8_lossy(&convert_output.stdout);
+        let c_stderr = String::from_utf8_lossy(&convert_output.stderr);
+        if !c_stdout.trim().is_empty() {
+            tracing::info!("qemu-img convert stdout: {}", c_stdout.trim());
+        }
+        if !c_stderr.trim().is_empty() {
+            tracing::info!("qemu-img convert stderr: {}", c_stderr.trim());
+        }
+
+        if !convert_output.status.success() {
             bail!("Failed to convert image to qcow2");
         }
 

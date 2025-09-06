@@ -1,0 +1,15 @@
+# Main sshd config
+Port 2222
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+KexAlgorithms curve25519-sha256
+Ciphers chacha20-poly1305@openssh.com
+MACs hmac-sha2-256
+HostKeyAlgorithms ssh-ed25519
+Include /etc/ssh/sshd_config.d/*.conf
+
+# Match block should be ignored for global metrics
+Match User root
+    PasswordAuthentication yes
+

@@ -245,18 +245,27 @@ impl Backend for LocalBackend {
         let mut all_vm_names: Vec<String> = scenario.vm.keys().cloned().collect();
         all_vm_names.sort();
 
-        // Resolve manipulations by label from scenario definitions, preserving VM declaration order
-        let selected_manipulations = {
-            let mut v = Vec::new();
-            for label in &config.manipulations {
-                if let Some(def) = scenario.manipulations.get(label) {
-                    v.push(def.clone());
-                } else {
-                    tracing::warn!("Manipulation '{}' not defined; skipping", label);
+        // Start with empty manipulations; they are derived from problems only now
+        let mut selected_manipulations = Vec::new();
+
+        // Merge problems into manipulations (tools -> packages-only, then optional manipulation)
+        for label in &config.problems {
+            if let Some(problem) = scenario.problems.get(label) {
+                if !problem.tools.packages.is_empty() {
+                    selected_manipulations.push(intar_scenario::Manipulation {
+                        packages: problem.tools.packages.clone(),
+                        script: None,
+                    });
                 }
+                if !problem.manipulation.packages.is_empty()
+                    || problem.manipulation.script.is_some()
+                {
+                    selected_manipulations.push(problem.manipulation.clone());
+                }
+            } else {
+                tracing::warn!("Problem '{}' not defined; skipping", label);
             }
-            v
-        };
+        }
 
         let mut vm = Vm::new_with_spec(crate::vm::VmCreateSpec {
             name: vm_name,
@@ -361,8 +370,10 @@ impl Backend for LocalBackend {
                         description: String::new(),
                         image: String::new(), // These fields aren't used for loading state
                         sha256: None,
+                        agent_otlp_endpoint: None,
+                        local_agent: None,
                         vm: HashMap::new(),
-                        manipulations: indexmap::IndexMap::new(),
+                        problems: indexmap::IndexMap::new(),
                     },
                 )
                 .await?
@@ -388,8 +399,10 @@ impl Backend for LocalBackend {
                         description: String::new(),
                         image: String::new(),
                         sha256: None,
+                        agent_otlp_endpoint: None,
+                        local_agent: None,
                         vm: HashMap::new(),
-                        manipulations: indexmap::IndexMap::new(),
+                        problems: indexmap::IndexMap::new(),
                     },
                 )
                 .await?

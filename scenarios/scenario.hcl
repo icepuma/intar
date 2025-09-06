@@ -1,5 +1,7 @@
 name = "Demo"
 
+local_agent = true
+
 description = <<EOF
 This is a demo scenario for testing the intar system.
 It demonstrates basic VM configuration with Ubuntu 24.04 LTS.
@@ -8,29 +10,35 @@ EOF
 
 image = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
 
-// Reusable named manipulations
-manipulation "tools" {
-  packages = ["htop"]
-  script = "echo 'htop installed'"
-}
+// A reusable problem that groups tools, a manipulation, and probes
+problem "file-fixed" {
+  description = "Ensure /home/intar/intar.txt contains 'fixed'"
 
-manipulation "jq-yq" {
-  packages = ["jq", "yq"]
-  script = <<EOF
-  echo 'running second manipulation'
-  jq --version || true
-  yq --version || true
-  EOF
-}
+  tools {
+    packages = ["htop", "jq", "yq"]
+  }
 
-manipulation "random-file" {
-  script = <<EOF
-  # create a random 1KB file for the intar user
-  head -c 1024 /dev/urandom > /home/intar/random.bin
-  chown intar:intar /home/intar/random.bin
-  EOF
+  // Optional extra setup; runs during cloud-init
+  manipulation {
+    script = <<EOF
+    echo "basic-sshd problem applied" | tee /etc/motd
+    # Ensure the marker file contains exact text without newline
+    printf "damaged" > /home/intar/intar.txt
+    chown intar:intar /home/intar/intar.txt
+    EOF
+  }
+
+  // Probe: validate file content equals "fixed"
+  probe "intar_txt_fixed" {
+    metric = "intar_agent_file_content"
+    labels = { path = "/home/intar/intar.txt", content = "fixed" }
+    op     = "eq"
+    value  = 1
+  }
 }
 
 vm "vm1" {
-  manipulations = ["tools", "jq-yq", "random-file"]
+  // Keep boot fast: no package manipulations
+  // Only reference the problem with the file-content probe
+  problems = ["file-fixed"]
 }

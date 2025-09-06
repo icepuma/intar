@@ -12,13 +12,20 @@ pub struct Scenario {
     /// Optional SHA256 checksum of the image for integrity verification
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Optional agent OTLP/HTTP endpoint; if set, baked into the agent systemd unit.
+    #[serde(default)]
+    pub agent_otlp_endpoint: Option<String>,
+    /// If true, load intar-agent from local `target/<target>/{release,debug}` instead of embedding.
+    /// When omitted, no agent is injected unless `INTAR_AGENT_BUNDLE` is set at runtime.
+    #[serde(default)]
+    pub local_agent: Option<bool>,
     #[serde(default)]
     pub vm: HashMap<String, VmConfig>,
 
-    /// Reusable manipulation definitions (labeled HCL blocks)
-    /// Usage inside a VM via labeled `manipulation "name" {}` blocks
-    #[serde(default, rename = "manipulation")]
-    pub manipulations: IndexMap<String, Manipulation>,
+    /// Reusable problems grouping tools, manipulation and probes.
+    /// Usage inside a VM via `problems = ["name", ...]`.
+    #[serde(default, rename = "problem")]
+    pub problems: IndexMap<String, Problem>,
 }
 
 #[cfg(test)]
@@ -36,8 +43,8 @@ mod tests {
         assert_eq!(s.name, "Demo");
         assert_eq!(s.sha256, None);
         let cfg = s.vm.get("vm1").unwrap();
-        assert_eq!(cfg.cpus, 2);
-        assert_eq!(cfg.memory, 2048);
+        assert_eq!(cfg.cpus, 1);
+        assert_eq!(cfg.memory, 512);
     }
 
     #[test]
@@ -58,51 +65,16 @@ mod tests {
         assert_eq!(cfg.memory, 4096);
     }
 
-    #[test]
-    fn parse_with_multiple_manipulation_blocks() {
-        let hcl = r#"
-            name = "ManipDemo"
-            image = "https://example.com/x.img"
-            manipulation "first" {
-              packages = ["curl"]
-              script = "echo first"
-            }
-            manipulation "second" {
-              packages = ["jq"]
-              script = <<EOF
-              echo second
-              jq --version || true
-              EOF
-            }
-            vm "toolbox" {
-              cpus = 2
-              memory = 2048
-              manipulations = ["first", "second"]
-            }
-        "#;
-        let s: Scenario = hcl::from_str(hcl).expect("parse");
-        let cfg = s.vm.get("toolbox").unwrap();
-        assert_eq!(cfg.manipulations, vec!["first", "second"]);
-        assert_eq!(s.manipulations.get("first").unwrap().packages, vec!["curl"]);
-        assert!(
-            s.manipulations
-                .get("second")
-                .unwrap()
-                .script
-                .as_ref()
-                .unwrap()
-                .contains("jq --version")
-        );
-    }
+    // Manipulations are now part of problems; top-level manipulation blocks removed.
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct VmConfig {
-    /// Number of CPUs for this VM (defaults to 2)
+    /// Number of CPUs for this VM (defaults to 1)
     #[serde(default = "default_cpus")]
     pub cpus: u8,
 
-    /// Memory in MB for this VM (defaults to 2048)
+    /// Memory in MB for this VM (defaults to 512)
     #[serde(default = "default_memory")]
     pub memory: u32,
 
@@ -114,10 +86,10 @@ pub struct VmConfig {
     #[serde(default)]
     pub network: Option<NetworkConfig>,
 
-    /// References to reusable manipulation definitions by label.
-    /// Declare as a simple list: `manipulations = ["tools", "jq"]`.
+    /// References to reusable problem definitions by label.
+    /// Problems group tools, manipulation and probes.
     #[serde(default)]
-    pub manipulations: Vec<String>,
+    pub problems: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -157,15 +129,80 @@ pub struct Manipulation {
     pub script: Option<String>,
 }
 
+/// Packages and utilities needed by a problem.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct Tools {
+    /// Packages to install.
+    #[serde(default)]
+    pub packages: Vec<String>,
+}
+
+/// Comparison operator for probe evaluation.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Comparator {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+impl Default for Comparator {
+    fn default() -> Self {
+        Self::Eq
+    }
+}
+
+/// A single Prometheus metric assertion.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProbeSpec {
+    /// Metric name to evaluate.
+    pub metric: String,
+    /// Optional label filters (subset match).
+    #[serde(default)]
+    pub labels: IndexMap<String, String>,
+    /// Comparator to apply against the observed value.
+    #[serde(default)]
+    pub op: Comparator,
+    /// Target value to compare against.
+    pub value: f64,
+    /// Optional timeout per probe in milliseconds (defaults provided at runtime).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Optional polling interval in milliseconds (defaults provided at runtime).
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+}
+
+/// Reusable problem definition.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct Problem {
+    /// Short description of the problem.
+    #[serde(default)]
+    pub description: String,
+    /// Tools (packages) to install.
+    #[serde(default)]
+    pub tools: Tools,
+    /// Manipulation to apply (packages + one script).
+    #[serde(default)]
+    pub manipulation: Manipulation,
+    /// Probes to be evaluated for VMs referencing this problem.
+    /// Declared as labeled blocks: `probe "name" { ... }`.
+    #[serde(default, rename = "probe")]
+    pub probes: IndexMap<String, ProbeSpec>,
+}
+
 // Empty ref type removed: we now reference by string labels for simplicity
 
 // Default values
 const fn default_cpus() -> u8 {
-    2
+    1
 }
 
 const fn default_memory() -> u32 {
-    2048
+    512
 }
 
 const fn default_route_metric() -> u32 {

@@ -22,6 +22,13 @@ pub struct CloudInitConfig {
     // Manipulations support
     pub manipulation_packages: Vec<String>,
     pub manipulation_scripts: Vec<String>,
+    // Agent embedding
+    pub agent_bundle_gz_b64: Option<String>,
+    pub agent_sha256_hex: Option<String>,
+    pub agent_otlp_endpoint: Option<String>,
+    pub agent_metadata_url: Option<String>,
+    pub agent_from_iso: bool,
+    pub agent_iso_label: Option<String>,
 }
 
 /// Configuration carrier for `CloudInitConfig::new` to keep the constructor
@@ -46,6 +53,17 @@ pub struct CloudInitSpec {
     pub manipulation_packages: Vec<String>,
     /// Post-install scripts to be executed in order.
     pub manipulation_scripts: Vec<String>,
+    /// Optional embedded agent (gz+b64) and checksum.
+    pub agent_bundle_gz_b64: Option<String>,
+    pub agent_sha256_hex: Option<String>,
+    /// Optional OTLP HTTP endpoint override for agent.
+    pub agent_otlp_endpoint: Option<String>,
+    /// Optional metadata discovery URL for the agent (host-side server).
+    pub agent_metadata_url: Option<String>,
+    /// If true, mount an ISO volume and copy agent from it instead of embedding.
+    pub agent_from_iso: bool,
+    /// ISO volume label to mount (e.g., "INTARAGENT").
+    pub agent_iso_label: Option<String>,
 }
 
 impl CloudInitConfig {
@@ -62,6 +80,135 @@ impl CloudInitConfig {
             all_vm_names: spec.all_vm_names,
             manipulation_packages: spec.manipulation_packages,
             manipulation_scripts: spec.manipulation_scripts,
+            agent_bundle_gz_b64: spec.agent_bundle_gz_b64,
+            agent_sha256_hex: spec.agent_sha256_hex,
+            agent_otlp_endpoint: spec.agent_otlp_endpoint,
+            agent_metadata_url: spec.agent_metadata_url,
+            agent_from_iso: spec.agent_from_iso,
+            agent_iso_label: spec.agent_iso_label,
+        }
+    }
+
+    fn packages_yaml_and_update(&self) -> (String, &'static str) {
+        if self.manipulation_packages.is_empty() {
+            ("[]".to_string(), "false")
+        } else {
+            let quoted: Vec<String> = self
+                .manipulation_packages
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect();
+            (format!("[{}]", quoted.join(", ")), "true")
+        }
+    }
+
+    fn generate_manip_write_files_and_runcmd(&self) -> (String, String) {
+        let mut write_files = String::new();
+        let mut runcmd = String::new();
+        for (i, script) in self.manipulation_scripts.iter().enumerate() {
+            let idx = i + 1;
+            let body = if script.trim_start().starts_with("#!") {
+                script.clone()
+            } else {
+                format!("#!/usr/bin/env bash\n{script}")
+            };
+            let content = body.replace('\n', "\n      ");
+            let path = format!("/var/lib/intar/manipulations-{idx}.sh");
+            let _ = write!(
+                write_files,
+                r"  - path: {path}
+    owner: root:root
+    permissions: '0755'
+    content: |
+      {content}
+"
+            );
+            let _ = writeln!(runcmd, "  - {path}");
+        }
+        (write_files, runcmd)
+    }
+
+    fn compose_base_user_header(
+        &self,
+        hostname: &str,
+        packages_yaml: &str,
+        package_update: &'static str,
+    ) -> String {
+        format!(
+            r"{header}
+hostname: {hostname}
+manage_etc_hosts: true
+
+# Create the intar user with sudo access
+users:
+  - name: {username}
+    gecos: Intar User
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    groups: sudo
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - {ssh_public_key}
+
+# SSH configuration (ensure host keys + key-only auth)
+# Generate multiple host key types for broader distro compatibility
+ssh_genkeytypes: [ed25519, rsa, ecdsa]
+ssh_deletekeys: false
+ssh_pwauth: false
+disable_root: true
+
+# Package management (faster boot)
+package_update: {package_update}
+package_upgrade: false
+packages: {packages}
+
+# System configuration
+timezone: UTC
+locale: en_US.UTF-8
+
+",
+            header = CLOUD_CONFIG_HEADER,
+            hostname = hostname,
+            username = DEFAULT_USERNAME,
+            ssh_public_key = self.ssh_public_key.trim(),
+            packages = packages_yaml,
+            package_update = package_update,
+        )
+    }
+
+    fn append_agent_write_files(&self, out: &mut String) {
+        if self.agent_bundle_gz_b64.is_some() {
+            if let Some(agent_wf) = self.generate_agent_write_files_embed() {
+                out.push_str(&agent_wf);
+            }
+        } else if let Some(agent_wf) = self.generate_agent_unit_file_only() {
+            out.push_str(&agent_wf);
+        }
+    }
+
+    // bootcmd path removed: agent starts via runcmd only
+
+    fn append_agent_runcmd(&self, out: &mut String) {
+        if self.agent_bundle_gz_b64.is_some() {
+            out.push_str(
+                "  - systemctl daemon-reload\n  - systemctl enable --now intar-agent.service\n",
+            );
+        } else if self.agent_from_iso {
+            let label = self
+                .agent_iso_label
+                .clone()
+                .unwrap_or_else(|| "INTARAGENT".to_string());
+            let copy_cmds = format!(
+                concat!(
+                    "  - mkdir -p /mnt/intar-agent\n",
+                    "  - bash -c 'mount -L {label} /mnt/intar-agent || (blkid -L {label} && mount $(blkid -L {label}) /mnt/intar-agent)'\n",
+                    "  - cp /mnt/intar-agent/intar-agent /usr/local/bin/intar-agent\n",
+                    "  - chmod 0755 /usr/local/bin/intar-agent\n",
+                    "  - systemctl daemon-reload\n",
+                    "  - systemctl enable --now intar-agent.service\n"
+                ),
+                label = label
+            );
+            out.push_str(&copy_cmds);
         }
     }
 
@@ -122,103 +269,33 @@ impl CloudInitConfig {
     #[must_use]
     pub fn generate_user_data(&self) -> String {
         let hostname = format!("{}-{}", self.vm_name, self.scenario_name);
-        // Compose packages list (manipulation packages only for now)
-        let packages_yaml = if self.manipulation_packages.is_empty() {
-            "[]".to_string()
-        } else {
-            // YAML inline list of strings
-            let quoted: Vec<String> = self
-                .manipulation_packages
-                .iter()
-                .map(|p| format!("'{}'", p.replace('\'', "''")))
-                .collect();
-            format!("[{}]", quoted.join(", "))
-        };
+        // Compose packages list and update flag
+        let (packages_yaml, package_update) = self.packages_yaml_and_update();
 
         // Prepare write_files for hosts and optional manipulation scripts
         let (host_write_file_item, runcmd_base_yaml) =
             self.generate_hosts_write_files_and_runcmd_items();
 
         // Optional multiple manipulation scripts write_files and runcmd entries
-        let mut manip_write_file_items = String::new();
-        let mut manip_runcmd_items = String::new();
-        for (i, script) in self.manipulation_scripts.iter().enumerate() {
-            let idx = i + 1;
-            // Ensure a portable bash shebang is present
-            let body = if script.trim_start().starts_with("#!") {
-                script.clone()
-            } else {
-                format!("#!/usr/bin/env bash\n{script}")
-            };
-            let content = body.replace('\n', "\n      ");
-            let path = format!("/var/lib/intar/manipulations-{idx}.sh");
-            let _ = write!(
-                manip_write_file_items,
-                r"  - path: {path}
-    owner: root:root
-    permissions: '0755'
-    content: |
-      {content}
-"
-            );
-            let _ = writeln!(manip_runcmd_items, "  - {path}");
-        }
+        let (manip_write_file_items, manip_runcmd_items) =
+            self.generate_manip_write_files_and_runcmd();
 
-        // Compose final YAML
-        let mut out = String::new();
-        let package_update = if self.manipulation_packages.is_empty() {
-            "false"
-        } else {
-            "true"
-        };
-        let _ = write!(
-            out,
-            r"{header}
-hostname: {hostname}
-manage_etc_hosts: true
-
-# Create the intar user with sudo access
-users:
-  - name: {username}
-    gecos: Intar User
-    sudo: ['ALL=(ALL) NOPASSWD:ALL']
-    groups: sudo
-    shell: /bin/bash
-    ssh_authorized_keys:
-      - {ssh_public_key}
-
-# SSH configuration (faster)
-ssh_genkeytypes: [ed25519]
-ssh_deletekeys: false
-ssh_pwauth: false
-disable_root: true
-
-# Package management (faster boot)
-package_update: {package_update}
-package_upgrade: false
-packages: {packages}
-
-# System configuration
-timezone: UTC
-locale: en_US.UTF-8
-
-",
-            header = CLOUD_CONFIG_HEADER,
-            hostname = hostname,
-            username = DEFAULT_USERNAME,
-            ssh_public_key = self.ssh_public_key.trim(),
-            packages = packages_yaml,
-            package_update = package_update,
-        );
+        // Compose final YAML header
+        let mut out = self.compose_base_user_header(&hostname, &packages_yaml, package_update);
 
         // write_files list
         out.push_str("write_files:\n");
         out.push_str(&host_write_file_item);
         out.push_str(&manip_write_file_items);
+        self.append_agent_write_files(&mut out);
 
-        // runcmd section
+        // runcmd section (start agent as early as possible for ISO case)
         out.push_str("runcmd:\n");
+        // 1) Start agent first (mount/copy if from ISO, then enable/start)
+        self.append_agent_runcmd(&mut out);
+        // 2) Base system tweaks and hosts entries
         out.push_str(&runcmd_base_yaml);
+        // 3) Manipulation scripts last
         out.push_str(&manip_runcmd_items);
 
         // Final message
@@ -228,6 +305,125 @@ locale: en_US.UTF-8
         );
 
         out
+    }
+
+    fn generate_agent_write_files_embed(&self) -> Option<String> {
+        let bundle = self.agent_bundle_gz_b64.as_ref()?;
+        let endpoint = self
+            .agent_otlp_endpoint
+            .clone()
+            .unwrap_or_else(|| "http://10.0.2.2:4318/v1/metrics".to_string());
+        let md_url = self.agent_metadata_url.clone().unwrap_or_else(|| {
+            let port = crate::constants::metadata_port(self.scenario_id);
+            format!("http://10.0.2.2:{port}/agent-config")
+        });
+
+        let exec_args = if self.agent_otlp_endpoint.is_some() {
+            format!(" --otlp-endpoint {endpoint}")
+        } else {
+            String::new()
+        };
+        // Agent interval: allow host to override via INTAR_AGENT_INTERVAL_SEC, default to 1s for snappy updates
+        let interval =
+            std::env::var("INTAR_AGENT_INTERVAL_SEC").unwrap_or_else(|_| "1".to_string());
+        let unit = format!(
+            r"[Unit]
+Description=Intar Agent
+After=local-fs.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=INTAR_METADATA_URL={md_url}
+ExecStart=/usr/local/bin/intar-agent --interval {interval}{exec_args}
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+"
+        );
+
+        let mut out = String::new();
+        // Binary file
+        let _ = write!(
+            out,
+            r"  - path: /usr/local/bin/intar-agent
+    owner: root:root
+    permissions: '0755'
+    encoding: gz+b64
+    content: '{bundle}'
+"
+        );
+        // Unit file
+        let _ = write!(
+            out,
+            r"  - path: /etc/systemd/system/intar-agent.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      {unit}
+",
+            unit = unit.replace('\n', "\n      ")
+        );
+        Some(out)
+    }
+
+    fn generate_agent_unit_file_only(&self) -> Option<String> {
+        if !self.agent_from_iso {
+            return None;
+        }
+        let endpoint = self
+            .agent_otlp_endpoint
+            .clone()
+            .unwrap_or_else(|| "http://10.0.2.2:4318/v1/metrics".to_string());
+        let md_url = self.agent_metadata_url.clone().unwrap_or_else(|| {
+            let port = crate::constants::metadata_port(self.scenario_id);
+            format!("http://10.0.2.2:{port}/agent-config")
+        });
+
+        let exec_args = if self.agent_otlp_endpoint.is_some() {
+            format!(" --otlp-endpoint {endpoint}")
+        } else {
+            String::new()
+        };
+        // Agent interval: allow host to override via INTAR_AGENT_INTERVAL_SEC, default to 1s for snappy updates
+        let interval =
+            std::env::var("INTAR_AGENT_INTERVAL_SEC").unwrap_or_else(|_| "1".to_string());
+        let unit = format!(
+            r"[Unit]
+Description=Intar Agent
+After=local-fs.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=INTAR_METADATA_URL={md_url}
+ExecStart=/usr/local/bin/intar-agent --interval {interval}{exec_args}
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+"
+        );
+
+        let mut out = String::new();
+        let _ = write!(
+            out,
+            r"  - path: /etc/systemd/system/intar-agent.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      {unit}
+",
+            unit = unit.replace('\n', "\n      ")
+        );
+        Some(out)
     }
 
     /// Generate /etc/hosts entries for all VMs and runcmd items to apply them
@@ -268,6 +464,8 @@ locale: en_US.UTF-8
             "  - systemctl disable --now apt-daily.service apt-daily.timer || true\n",
             "  - systemctl disable --now apt-daily-upgrade.service apt-daily-upgrade.timer || true\n",
             "  - systemctl disable --now motd-news.service motd-news.timer || true\n",
+            // Ensure SSH daemon is enabled and started (covers Debian/Ubuntu and RHEL/Fedora)
+            "  - bash -c 'systemctl enable --now ssh || systemctl enable --now sshd || true'\n",
         ));
 
         (write_file_item, runcmd_items)
@@ -416,6 +614,12 @@ mod tests {
             all_vm_names: vec!["vm1".into(), "vm2".into()],
             manipulation_packages: vec![],
             manipulation_scripts: vec![],
+            agent_bundle_gz_b64: None,
+            agent_sha256_hex: None,
+            agent_otlp_endpoint: None,
+            agent_metadata_url: None,
+            agent_from_iso: false,
+            agent_iso_label: None,
         });
         let net = cfg.generate_network_config();
         assert!(net.contains("172.30.42.10/24"), "net={net}");
@@ -434,6 +638,12 @@ mod tests {
             all_vm_names: vec!["web".into(), "db".into(), "cache".into()],
             manipulation_packages: vec![],
             manipulation_scripts: vec![],
+            agent_bundle_gz_b64: None,
+            agent_sha256_hex: None,
+            agent_otlp_endpoint: None,
+            agent_metadata_url: None,
+            agent_from_iso: false,
+            agent_iso_label: None,
         });
         let user = cfg.generate_user_data();
         assert!(user.starts_with("#cloud-config"));
@@ -458,6 +668,12 @@ mod tests {
             all_vm_names: vec!["toolbox".into()],
             manipulation_packages: vec!["curl".into(), "jq".into()],
             manipulation_scripts: vec!["echo one".into(), "echo two".into()],
+            agent_bundle_gz_b64: None,
+            agent_sha256_hex: None,
+            agent_otlp_endpoint: None,
+            agent_metadata_url: None,
+            agent_from_iso: false,
+            agent_iso_label: None,
         });
         let user = cfg.generate_user_data();
         assert!(user.contains("packages: ['curl', 'jq']"), "{user}");

@@ -54,7 +54,7 @@ Areas covered by tests
 - Scopes: prefer crate names or areas, e.g., `intar-scenario`, `intar-local-backend`, `intar`.
 
 Examples
-- `feat(intar-scenario): add reusable manipulations`
+- `feat(intar-scenario): add problems model`
 - `fix(intar-local-backend): ensure portable bash shebang`
 - `chore(intar): add scenario pre-check command`
 
@@ -65,8 +65,8 @@ Examples
   - Prefer runnable doctests; use `no_run` for examples that perform I/O or spawn processes.
   - Link types and modules in docs using intra-doc links (e.g., `[CloudInitConfig]`).
 - Keep README and scenario spec examples in sync with code changes.
-  - Scenario HCL: document named `manipulation "name" {}` blocks and VM references via `manipulations = ["name", ...]`.
-  - Explain manipulation behavior (merged packages, portable bash shebang, script order, file paths).
+  - Scenario HCL: document `problem "name" {}` blocks (grouping tools, optional manipulation, and probes) and VM references via `problems = ["name", ...]`).
+  - Explain behavior: tools packages merge (deduped, order-preserved), optional single manipulation script per problem, and probe semantics.
 - Environment docs: document env vars affecting runtime (e.g., `INTAR_QMP_CONNECT_TIMEOUT_MS`, `INTAR_QMP_COMMAND_TIMEOUT_MS`).
 - Mark important return-value expectations with `#[must_use]` and document why when relevant.
 - When adding new features, update inline rustdoc, README, and any sample scenarios under `scenarios/`.

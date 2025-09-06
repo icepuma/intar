@@ -80,7 +80,7 @@ impl ScenarioRunner {
             return Ok(());
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Setting up cloud-init and starting {} VMs...",
             self.vms.len()
         );
@@ -91,7 +91,7 @@ impl ScenarioRunner {
 
         let start_futs = names.into_iter().filter_map(|name| {
             self.vms.get(&name).map(|vm| async move {
-                tracing::info!("Starting VM: {}", name);
+                tracing::debug!("Starting VM: {}", name);
                 vm.start()
                     .await
                     .with_context(|| format!("Failed to start VM: {name}"))?;
@@ -99,7 +99,7 @@ impl ScenarioRunner {
                     .ssh_info()
                     .await
                     .with_context(|| format!("Failed to get SSH info for VM: {name}"))?;
-                tracing::info!(
+                tracing::debug!(
                     "VM {} started successfully with SSH access on port {}",
                     name,
                     ssh_info.port
@@ -112,7 +112,7 @@ impl ScenarioRunner {
             .await
             .context("One or more VMs failed to start")?;
 
-        tracing::info!("All VMs started successfully with cloud-init SSH configuration");
+        tracing::debug!("All VMs started successfully with cloud-init SSH configuration");
         Ok(())
     }
 
@@ -125,7 +125,7 @@ impl ScenarioRunner {
             return Ok(());
         }
 
-        tracing::info!("Stopping {} VMs concurrently...", self.vms.len());
+        tracing::debug!("Stopping {} VMs concurrently...", self.vms.len());
 
         // Create concurrent stop operations
         let stop_futures: Vec<_> = self
@@ -138,7 +138,7 @@ impl ScenarioRunner {
                     vm.stop()
                         .await
                         .with_context(|| format!("Failed to stop VM: {name}"))?;
-                    tracing::info!("VM {} stopped successfully", name);
+                    tracing::debug!("VM {} stopped successfully", name);
                     Ok::<(), anyhow::Error>(())
                 }
             })
@@ -147,7 +147,7 @@ impl ScenarioRunner {
         // Execute all stops concurrently
         try_join_all(stop_futures).await?;
 
-        tracing::info!("All VMs stopped successfully");
+        tracing::debug!("All VMs stopped successfully");
         Ok(())
     }
 
@@ -202,18 +202,18 @@ impl ScenarioRunner {
     }
 }
 
-/// Validate that all VM-declared manipulation references exist in the scenario.
+/// Validate that all VM-declared problem references exist in the scenario.
 fn validate_scenario_references(scenario: &Scenario) -> Result<()> {
     use anyhow::bail;
 
-    let defined: std::collections::HashSet<&str> =
-        scenario.manipulations.keys().map(String::as_str).collect();
+    let defined_problems: std::collections::HashSet<&str> =
+        scenario.problems.keys().map(String::as_str).collect();
 
     for (vm_name, vm) in &scenario.vm {
-        for label in &vm.manipulations {
-            if !defined.contains(label.as_str()) {
+        for label in &vm.problems {
+            if !defined_problems.contains(label.as_str()) {
                 bail!(
-                    "Scenario '{}' VM '{}' references unknown manipulation '{}'. Define it with: manipulation \"{}\" {{ ... }}",
+                    "Scenario '{}' VM '{}' references unknown problem '{}'. Define it with: problem \"{}\" {{ ... }}",
                     scenario.name,
                     vm_name,
                     label,

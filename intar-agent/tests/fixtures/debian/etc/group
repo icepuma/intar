@@ -1,0 +1,6 @@
+root:x:0:
+daemon:x:1:
+sudo:x:27:alice
+users:x:100:
+devs:x:1001:bob
+

@@ -13,7 +13,8 @@ Quickstart (rootless)
   - Fedora: `sudo dnf install qemu-system qemu-img genisoimage`
 - aarch64 firmware: install EDK2/UEFI (e.g., `edk2-aarch64`); the path is auto-detected.
 - Run (foreground): `cargo run --bin intar -- scenario run MultiDemo`
-  - Press Ctrl+C to stop. Shutdown + cleanup run automatically.
+  - Runs in the foreground with `tracing` logs and a TUI.
+  - Press Ctrl+C to stop and clean up all scenario data.
 - SSH into a VM: `cargo run --bin intar -- scenario ssh MultiDemo web`
 - Status: `cargo run --bin intar -- scenario status MultiDemo`
 
@@ -31,9 +32,9 @@ Examples
  - Name-based ping (from within a VM): `ping db` or `ping db.<Scenario>`
 
 Notes
-- Foreground run shows progress spinners; logs via `tracing` (set `RUST_LOG=info`).
+- Set `RUST_LOG=info` to increase backend logging.
 - Acceleration: macOS `-accel hvf`; Linux `-enable-kvm -cpu host` (ensure permissions).
-- Resources: taken from scenario (`cpus`, `memory`); defaults `2 CPUs`, `2048 MB`.
+- Resources: taken from scenario (`cpus`, `memory`); defaults `1 CPU`, `512 MB`.
 - aarch64 firmware is auto-detected; install EDK2 if missing.
 - Base images download to the user cache on first run.
 
@@ -46,29 +47,73 @@ Scenario spec (HCL)
   - `sha256 = "<sha256-hex>"` verifies the downloaded image
   - VM resources: `vm "web" { cpus = 4 memory = 4096 }`
 
-Manipulations (post-install)
-- Define reusable scenario-level manipulations, then reference them per VM:
-  - All `packages` from referenced manipulations are merged (deduped, order-preserved) and installed first.
-  - Each manipulation’s `script` runs as root during `runcmd` in declaration order.
-  - Scripts are written to `/var/lib/intar/manipulations-<n>.sh` with a portable bash shebang.
+Problems (tools + optional manipulation + probes)
+- Define reusable `problem "name" { ... }` blocks that can be attached to VMs via `problems = ["name", ...]`.
+- A problem may include:
+  - `tools { packages = [ ... ] }` — packages to install.
+  - `manipulation { script = "..." }` — one shell script to run during cloud-init (optional).
+  - One or more `probe "label" { metric = "..." ... }` checks to validate the system.
 
 Example:
 ```
-manipulation "tools" {
-  packages = ["curl", "jq"]
-  script = <<EOF
-  echo "tools ready"
-  curl --version || true
-  jq --version || true
-  EOF
+problem "tools-ready" {
+  tools { packages = ["curl", "jq"] }
+  manipulation {
+    script = <<EOF
+    echo "tools ready"
+    curl --version || true
+    jq --version || true
+    EOF
+  }
 }
 
 vm "toolbox" {
   cpus = 2
   memory = 2048
-  manipulations = ["tools"]
+  problems = ["tools-ready"]
 }
 ```
+
+File-content training example
+```
+// A problem that starts in a failing state so learners can fix it
+problem "file-fixed" {
+  description = "Ensure /home/intar/intar.txt contains 'INTAR READY'"
+
+  // Intentionally set a non-matching value during cloud-init
+  manipulation {
+    script = <<EOF
+    # Avoid trailing newline: use printf, not echo
+    printf "INTAR PENDING" > /home/intar/intar.txt
+    chown intar:intar /home/intar/intar.txt
+    EOF
+  }
+
+  // Probe: exported by intar-agent as a labeled metric
+  probe "intar_txt_fixed" {
+    metric = "intar_agent_file_content"
+    labels = { path = "/home/intar/intar.txt", content = "INTAR READY" }
+    op     = "eq"
+    value  = 1
+  }
+}
+
+vm "web" {
+  problems = ["file-fixed"]
+}
+```
+Notes
+- The agent only reports file metrics for a whitelisted set of paths; `/home/intar/intar.txt` is allowed.
+- Fix the problem by setting the exact content without a newline:
+  - Inside the VM: `printf "INTAR READY" > /home/intar/intar.txt`
+
+Problems UI
+- Shows immediately during boot. Before probes are reachable, VMs appear with a ⏳ indicator.
+- Per-problem header icon:
+  - ❌ when any assigned VM hasn’t passed all its probes.
+  - ✅ once all assigned VMs have passed; flips back to ❌ on any regression.
+- Per-VM lines under each problem show that VM’s status (✅/❌/⏳).
+- Multi-VM exercises: assign the same problem to multiple VMs; the header flips to ✅ only when all are fixed.
 
 Paths and logs
 - Cache images: `~/.cache/intar/images/`
@@ -80,6 +125,7 @@ Paths and logs
   - QMP socket: `vm.qmp`
   - PID file: `vm.pid`
   - Log: `vm.log`
+  - Scenario log: `scenario.log`
 
 Dev workflow
 - Lint/format/tests: `just check` (fmt + clippy pedantic/nursery/cargo + tests)
@@ -90,7 +136,62 @@ Dev workflow
   - `cargo run --bin intar -- scenario ssh MultiDemo web`
 
 Env knobs
-- `INTAR_QMP_CONNECT_TIMEOUT_MS`, `INTAR_QMP_COMMAND_TIMEOUT_MS` to tune QMP timeouts.
+- `INTAR_QMP_CONNECT_TIMEOUT_MS`, `INTAR_QMP_COMMAND_TIMEOUT_MS` tune QMP timeouts.
+- `INTAR_AGENT_TARGET` overrides the agent target triple used when resolving a local build
+  (default: `aarch64-unknown-linux-musl`).
+- `INTAR_TUI_DISABLE_KEYS=1` disables TUI key handling (no raw mode); use OS signals (Ctrl+C) to stop.
+- Agent discovery/config:
+  - Host: `INTAR_AGENT_DISCOVERY_OTLP` changes the OTLP/HTTP endpoint returned by the
+    built-in metadata server (`/agent-config`).
+  - Guest: `INTAR_AGENT_OTLP_ENDPOINT` overrides the agent’s OTLP endpoint directly
+    (systemd unit passes it as `--otlp-endpoint` when set).
+- Probes and scraping:
+  - `INTAR_PROBES_DEFAULT_INTERVAL_MS` controls the probe polling interval (default: 1000).
+  - `INTAR_METRICS_SCRAPE_TIMEOUT_MS` sets the HTTP timeout for `/metrics` scrapes (default: 2000).
 
 Clippy
 - You may observe cargo “multiple crate versions” warnings due to transitive deps; acceptable for now.
+
+- Intar Agent (in-VM metrics)
+- Purpose: Collect VM metrics and push OpenTelemetry (OTLP/HTTP) to the host.
+- Providing the agent binary: build `intar-agent` yourself, then either:
+  - Option 1 (recommended for dev): add `local_agent = true` to the scenario to load the
+    agent from `target/<target>/{release,debug}/intar-agent`.
+    - Example build: `cargo build -p intar-agent --release --target aarch64-unknown-linux-musl`
+  - Option 2: set `INTAR_AGENT_BUNDLE=/abs/path/to/intar-agent` to use a specific binary path.
+  - If neither is provided, no agent is injected.
+- How it’s injected at boot:
+  - Preferred: the CLI embeds the agent into cloud-init (`gz+b64`) and writes it to
+    `/usr/local/bin/intar-agent`, then enables a systemd unit.
+  - Fallback: if embedding fails, it mounts a small ISO (label `INTARAGENT`) and copies the
+    binary in cloud-init before enabling the unit.
+- Default OTLP endpoint: `http://10.0.2.2:4318/v1/metrics` (host alias via QEMU user NAT).
+  - Override via the guest env `INTAR_AGENT_OTLP_ENDPOINT`, or set the host env
+    `INTAR_AGENT_DISCOVERY_OTLP` to change what the built-in metadata server returns at
+    `/agent-config` (the agent reads `INTAR_METADATA_URL` for discovery).
+- Metrics exposed (partial list):
+  - Open ports: `intar_agent_open_port{proto,port}`, `intar_agent_open_ports_total`
+  - Users/groups: `intar_agent_user_group{user,group}`, `..._users_total`, `..._groups_total`
+  - Files (whitelist): `..._file_exists|mode|uid|gid{path}`
+  - sshd security: presence, port, auth booleans, crypto lists, forwarding/limits, access lists
+
+Host OTLP collector example
+```
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  debug:
+    verbosity: detailed
+processors:
+  batch: {}
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+```
+Run with the OpenTelemetry Collector (or your stack) on the host; the VM agent will reach it at `10.0.2.2:4318`.
