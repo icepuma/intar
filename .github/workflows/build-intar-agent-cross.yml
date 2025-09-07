@@ -27,15 +27,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - name: Install cross
-        uses: taiki-e/setup-cross@v1
-
       - name: Build intar-agent with cross
-        run: cross build --package intar-agent --release --target ${{ matrix.target }} --locked
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          toolchain: stable
+          args: "--locked --release -p intar-agent"
