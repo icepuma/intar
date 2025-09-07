@@ -44,6 +44,7 @@ pub enum VmPhase {
 pub struct UiState {
     pub scenario_name: String,
     pub total_vms: usize,
+    pub quote: Option<(String, String)>, // (text, person)
     pub step_prepare: StepState,
     pub step_hub: StepState,
     pub step_metadata: StepState,
@@ -72,6 +73,7 @@ impl UiState {
         Self {
             scenario_name,
             total_vms: vm_names.len(),
+            quote: None,
             step_prepare: StepState::Pending,
             step_hub: StepState::Pending,
             step_metadata: StepState::Pending,
@@ -333,6 +335,31 @@ fn render_steps(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard:
     f.render_widget(steps_par, area);
 }
 
+fn render_quote(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard: &UiState) {
+    if let Some((text, person)) = &guard.quote {
+        let content = Line::from(vec![
+            Span::styled("“", Style::default().fg(Color::DarkGray)),
+            Span::raw(text.clone()),
+            Span::styled("” — ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                person.clone(),
+                Style::default().add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        let mut par = Paragraph::new(content).block(
+            Block::bordered()
+                .title(" Random Stargate Quotes ")
+                .padding(Padding::new(1, 1, 1, 1)),
+        );
+        par = par.wrap(ratatui::widgets::Wrap { trim: true });
+        f.render_widget(par, area);
+    } else {
+        // Render an empty spacer block to keep layout stable
+        let par = Paragraph::new("").block(Block::default().padding(Padding::new(0, 0, 0, 0)));
+        f.render_widget(par, area);
+    }
+}
+
 fn render_vm_table(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard: &UiState) {
     let rows = vm_rows(guard);
     let table = Table::new(
@@ -460,17 +487,19 @@ fn render_frame(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Length(10),
             Constraint::Min(6),
             Constraint::Min(6),
         ])
         .split(size);
     render_header(f, chunks[0], guard, enable_keys);
-    render_steps(f, chunks[1], guard);
-    render_vm_table(f, chunks[2], guard);
+    render_quote(f, chunks[1], guard);
+    render_steps(f, chunks[2], guard);
+    render_vm_table(f, chunks[3], guard);
     render_problems_panel(
         f,
-        chunks[3],
+        chunks[4],
         snapshot,
         vm_problems_snapshot,
         problem_descs_snapshot,

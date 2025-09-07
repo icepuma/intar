@@ -45,6 +45,7 @@ type SshEndpoint = (String, String, u16, String, String); // (vm_name, host, por
 mod bundle;
 mod metrics;
 mod probes;
+mod quotes;
 mod tui;
 
 fn hub_port_for_scenario(name: &str) -> u16 {
@@ -581,19 +582,14 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
     init_file_logging_for_run(&scenario.name)?;
     let vm_names = build_vm_names(&scenario);
     let ui = create_ui(&scenario.name, &vm_names);
+    if let Some((q, who)) = crate::quotes::random_quote() {
+        let mut st = ui.state.lock().await;
+        st.quote = Some((q, who));
+    }
     let mut runner = ScenarioRunner::new(scenario)?;
     populate_static_vm_info(&runner, &ui, &vm_names).await;
 
-    runner
-        .prepare()
-        .await
-        .with_context(|| format!("Failed to prepare scenario '{name}'"))?;
-    {
-        let mut st = ui.state.lock().await;
-        st.step_prepare = crate::tui::StepState::Done;
-        st.step_hub = crate::tui::StepState::Running;
-    }
-
+    // Prepare resources and start aux services (hub + metadata) with UI updates
     let (hub_task, md_task, scenario_name) = prepare_and_start_services(&mut runner, &ui).await?;
 
     // Configure agent-related env for backend
@@ -630,20 +626,19 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
         }
     }
     // Wait for SSH readiness, but also honor OS Ctrl+C to stop & clean up early
-    tokio::select! {
-        // OS Ctrl+C (or TERM/HUP) during SSH wait: stop and clean up immediately
-        () = wait_for_signal() => {
-            // Stop probes engine task before shutdown
-            probe_task.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-                let _ = probe_task.await;
-            }).await;
-            return shutdown_phase(name, ui, &mut runner, hub_task, md_task, false).await;
+    // Wait for SSH or early shutdown
+    let early_shutdown = {
+        tokio::select! {
+            // OS Ctrl+C (or TERM/HUP) during SSH wait: stop and clean up immediately
+            () = wait_for_signal() => {
+                probe_task.abort();
+                true
+            }
+            () = wait_for_ssh_with_ui(&ui, &endpoints) => { false }
         }
-        () = wait_for_ssh_with_ui(&ui, &endpoints) => {}
-    }
-    if ui.quit_requested() {
-        // Early quit during boot (in-TUI Ctrl+C): stop and cleanup
+    };
+    if early_shutdown || ui.quit_requested() {
+        // Early quit during boot (OS signal or in-TUI Ctrl+C): stop and cleanup
         return shutdown_phase(name, ui, &mut runner, hub_task, md_task, true).await;
     }
     {
