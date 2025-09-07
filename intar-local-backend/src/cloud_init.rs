@@ -150,8 +150,8 @@ users:
       - {ssh_public_key}
 
 # SSH configuration (ensure host keys + key-only auth)
-# Generate multiple host key types for broader distro compatibility
-ssh_genkeytypes: [ed25519, rsa, ecdsa]
+# Generate only ED25519 host keys for faster boot
+ssh_genkeytypes: [ed25519]
 ssh_deletekeys: false
 ssh_pwauth: false
 disable_root: true
@@ -283,8 +283,27 @@ locale: en_US.UTF-8
         // Compose final YAML header
         let mut out = self.compose_base_user_header(&hostname, &packages_yaml, package_update);
 
+        // bootcmd: mask/disable Snap early to prevent activation
+        out.push_str("bootcmd:\n");
+        out.push_str(
+            concat!(
+                "  - systemctl mask snapd.service snapd.seeded.service snapd.apparmor.service snapd.socket || true\n",
+                "  - systemctl disable --now snapd.service snapd.seeded.service snapd.apparmor.service snapd.socket || true\n",
+                // Also prevent other noisy/slow services from activating early
+                "  - systemctl mask pollinate.service pollinate.timer ModemManager.service || true\n",
+                "  - systemctl disable --now pollinate.service pollinate.timer ModemManager.service || true\n",
+                // Explicitly mask unattended-upgrades to avoid background APT work
+                "  - systemctl mask unattended-upgrades.service || true\n",
+                "  - systemctl disable --now unattended-upgrades.service || true\n",
+            ),
+        );
+
         // write_files list
         out.push_str("write_files:\n");
+        // Restrict datasources via a cloud.cfg.d snippet to avoid user-data schema warnings
+        out.push_str(
+            "  - path: /etc/cloud/cloud.cfg.d/99-intar-datasource.cfg\n    owner: root:root\n    permissions: '0644'\n    content: |\n      datasource_list: [NoCloud]\n",
+        );
         out.push_str(&host_write_file_item);
         out.push_str(&manip_write_file_items);
         self.append_agent_write_files(&mut out);
@@ -295,6 +314,10 @@ locale: en_US.UTF-8
         self.append_agent_runcmd(&mut out);
         // 2) Base system tweaks and hosts entries
         out.push_str(&runcmd_base_yaml);
+        // Ensure SSH daemon is enabled/started (covers Debian/Ubuntu and RHEL/Fedora)
+        out.push_str(
+            "  - bash -c 'systemctl enable --now ssh || systemctl enable --now sshd || true'\n",
+        );
         // 3) Manipulation scripts last
         out.push_str(&manip_runcmd_items);
 
@@ -464,6 +487,15 @@ WantedBy=multi-user.target
             "  - systemctl disable --now apt-daily.service apt-daily.timer || true\n",
             "  - systemctl disable --now apt-daily-upgrade.service apt-daily-upgrade.timer || true\n",
             "  - systemctl disable --now motd-news.service motd-news.timer || true\n",
+            // Disable additional units that slow or clutter boot
+            "  - systemctl mask pollinate.service pollinate.timer ModemManager.service || true\n",
+            "  - systemctl disable --now pollinate.service pollinate.timer ModemManager.service || true\n",
+            // Also ensure unattended-upgrades is masked/disabled late if present
+            "  - systemctl mask unattended-upgrades.service || true\n",
+            "  - systemctl disable --now unattended-upgrades.service || true\n",
+            // Mask and stop Snap to avoid boot overhead
+            "  - systemctl mask snapd.service snapd.seeded.service snapd.apparmor.service || true\n",
+            "  - systemctl disable --now snapd.service snapd.seeded.service snapd.apparmor.service || true\n",
             // Ensure SSH daemon is enabled and started (covers Debian/Ubuntu and RHEL/Fedora)
             "  - bash -c 'systemctl enable --now ssh || systemctl enable --now sshd || true'\n",
         ));

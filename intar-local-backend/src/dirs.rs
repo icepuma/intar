@@ -13,6 +13,7 @@ const VM_STATE_FILENAME: &str = "state.json";
 const VM_PID_FILENAME: &str = "vm.pid";
 const VM_QMP_FILENAME: &str = "vm.qmp";
 const VM_LOG_FILENAME: &str = "vm.log";
+const VM_CONSOLE_LOG_FILENAME: &str = "console.log";
 
 #[derive(Debug, Clone)]
 pub struct IntarDirs {
@@ -163,6 +164,14 @@ impl IntarDirs {
     #[must_use]
     pub fn vm_log_file(&self, scenario: &str, vm: &str) -> PathBuf {
         self.runtime_vm_dir(scenario, vm).join(VM_LOG_FILENAME)
+    }
+
+    /// Get path for VM console capture log file (guest serial output)
+    /// /run/user/{uid}/intar/scenarios/{scenario}/{vm}/console.log
+    #[must_use]
+    pub fn vm_console_log_file(&self, scenario: &str, vm: &str) -> PathBuf {
+        self.runtime_vm_dir(scenario, vm)
+            .join(VM_CONSOLE_LOG_FILENAME)
     }
 
     // No separate hub process; foreground mode runs the hub in-process.

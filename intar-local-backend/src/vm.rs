@@ -44,6 +44,7 @@ pub struct VmState {
     pub qmp_socket: String,
     pub disk_path: String,
     pub log_file: String,
+    pub console_log_file: String,
     pub created_at: DateTime<Utc>,
 
     // Network configuration
@@ -65,7 +66,7 @@ const fn default_memory_state() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmNetworkState {
-    /// SSH port forwarding port on the host (not needed with `socket_vmnet` but kept for compatibility)
+    /// SSH port forwarding port on the host
     pub ssh_port: u16,
 
     /// MAC address for eth0 (single network interface)
@@ -98,6 +99,7 @@ pub struct Vm {
     pub qmp_socket: PathBuf,
     pub disk_path: PathBuf,
     pub log_file: PathBuf,
+    pub console_log_file: PathBuf,
     pub state_file: PathBuf,
     pub base_image: Option<PathBuf>,
     pub qemu_config: QemuConfig,
@@ -156,6 +158,9 @@ impl Vm {
         let qmp_socket = spec.dirs.vm_qmp_socket(&spec.scenario_name, &spec.name);
         let disk_path = spec.dirs.vm_disk_path(&spec.scenario_name, &spec.name);
         let log_file = spec.dirs.vm_log_file(&spec.scenario_name, &spec.name);
+        let console_log_file = spec
+            .dirs
+            .vm_console_log_file(&spec.scenario_name, &spec.name);
         let state_file = spec.dirs.vm_state_file(&spec.scenario_name, &spec.name);
 
         // Create network configuration
@@ -170,6 +175,7 @@ impl Vm {
             qmp_socket,
             disk_path,
             log_file,
+            console_log_file,
             state_file,
             base_image: None,
             qemu_config,
@@ -264,6 +270,7 @@ impl Vm {
         vm.qmp_socket = PathBuf::from(&vm_state.qmp_socket);
         vm.disk_path = PathBuf::from(&vm_state.disk_path);
         vm.log_file = PathBuf::from(&vm_state.log_file);
+        vm.console_log_file = PathBuf::from(&vm_state.console_log_file);
 
         vm.base_image = None; // Will be set externally if needed
         vm.network = vm_state.network; // Use network config from saved state
@@ -596,7 +603,11 @@ impl Vm {
         }
         // Prepare network and core QEMU args
         let (user_netdev, user_device, lan_netdev, lan_device) = self.network_arg_strings();
-        let drive_config = format!("file={},if=virtio,format=qcow2", self.disk_path.display());
+        // Prefer safe performance flags: writeback cache, threaded AIO (portable), and discard for trim support
+        let drive_config = format!(
+            "file={},if=virtio,format=qcow2,cache=writeback,aio=threads,discard=unmap",
+            self.disk_path.display()
+        );
         let qmp_config = format!("unix:{},server,nowait", self.qmp_socket.display());
         let mut qemu_args = self.base_qemu_args(
             &drive_config,
@@ -673,6 +684,20 @@ impl Vm {
             self.cpus.to_string(),
             "-m".into(),
             format!("{}M", self.memory_mb),
+            // Fast boot order: boot from disk only
+            "-boot".into(),
+            "order=c".into(),
+            // Provide RNG device to avoid early-boot entropy stalls
+            "-object".into(),
+            "rng-random,filename=/dev/urandom,id=rng0".into(),
+            "-device".into(),
+            "virtio-rng-pci,rng=rng0".into(),
+            // Capture guest serial console to a host-side log file
+            "-serial".into(),
+            format!(
+                "file:{}",
+                self.console_log_file.to_string_lossy().to_string()
+            ),
             // NAT NIC for SSH and internet access
             "-netdev".into(),
             user_netdev.to_string(),
@@ -707,7 +732,11 @@ impl Vm {
         );
         tracing::info!("PID file: {}", self.pid_file.display());
         tracing::info!("QMP socket: {}", self.qmp_socket.display());
-        tracing::info!("Log file: {}", self.log_file.display());
+        tracing::info!("Log file (qemu stderr): {}", self.log_file.display());
+        tracing::info!(
+            "Console log (guest serial): {}",
+            self.console_log_file.display()
+        );
     }
 
     async fn configure_optional_drives(
@@ -770,6 +799,9 @@ impl Vm {
             parent_dirs.insert(parent);
         }
         if let Some(parent) = self.log_file.parent() {
+            parent_dirs.insert(parent);
+        }
+        if let Some(parent) = self.console_log_file.parent() {
             parent_dirs.insert(parent);
         }
         if let Some(parent) = self.state_file.parent() {
@@ -846,6 +878,7 @@ impl Vm {
             qmp_socket: self.qmp_socket.to_string_lossy().into_owned(),
             disk_path: self.disk_path.to_string_lossy().into_owned(),
             log_file: self.log_file.to_string_lossy().into_owned(),
+            console_log_file: self.console_log_file.to_string_lossy().into_owned(),
             created_at: Utc::now(),
             network: self.network.clone(),
             cpus: self.cpus,

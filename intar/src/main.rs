@@ -7,6 +7,7 @@ use intar::scenario_runner::ScenarioRunner;
 use intar_scenario::{list_embedded_scenarios, read_embedded_scenario};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "intar")]
@@ -96,7 +97,6 @@ fn init_console_logging() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
-        .without_time()
         .compact()
         .try_init();
 }
@@ -114,7 +114,6 @@ fn init_file_logging_for_run(scenario_name: &str) -> AnyhowResult<std::path::Pat
     let writer = move || file.try_clone().unwrap();
     let subscriber = fmt()
         .with_target(false)
-        .without_time()
         .with_ansi(false)
         .compact()
         .with_writer(writer)
@@ -287,8 +286,16 @@ fn build_vm_names(scenario: &intar_scenario::Scenario) -> Vec<String> {
     vm_names
 }
 
-fn create_ui(scenario_name: &str, vm_names: &[String]) -> crate::tui::RunUi {
-    let st = crate::tui::UiState::new(scenario_name.to_string(), vm_names);
+fn create_ui(
+    scenario_name: &str,
+    scenario_description: &str,
+    vm_names: &[String],
+) -> crate::tui::RunUi {
+    let st = crate::tui::UiState::new(
+        scenario_name.to_string(),
+        scenario_description.to_string(),
+        vm_names,
+    );
     crate::tui::RunUi::new(st)
 }
 
@@ -335,7 +342,13 @@ async fn prepare_and_start_services(
     tokio::task::JoinHandle<()>,
     String,
 )> {
-    ui.state.lock().await.step_prepare = crate::tui::StepState::Running;
+    {
+        let mut st = ui.state.lock().await;
+        st.step_prepare = crate::tui::StepState::Running;
+        if st.step_prepare_started.is_none() {
+            st.step_prepare_started = Some(Instant::now());
+        }
+    }
     runner
         .prepare()
         .await
@@ -343,7 +356,13 @@ async fn prepare_and_start_services(
     {
         let mut st = ui.state.lock().await;
         st.step_prepare = crate::tui::StepState::Done;
+        if let Some(t0) = st.step_prepare_started.take() {
+            st.step_prepare_elapsed = Some(t0.elapsed());
+        }
         st.step_hub = crate::tui::StepState::Running;
+        if st.step_hub_started.is_none() {
+            st.step_hub_started = Some(Instant::now());
+        }
     }
 
     let scenario_name = runner.scenario.name.clone();
@@ -351,13 +370,25 @@ async fn prepare_and_start_services(
     {
         let mut st = ui.state.lock().await;
         st.step_hub = crate::tui::StepState::Done;
+        if let Some(t0) = st.step_hub_started.take() {
+            st.step_hub_elapsed = Some(t0.elapsed());
+        }
         st.step_metadata = crate::tui::StepState::Running;
+        if st.step_metadata_started.is_none() {
+            st.step_metadata_started = Some(Instant::now());
+        }
     }
     let (md_task, _md_port) = start_metadata_task(&scenario_name);
     {
         let mut st = ui.state.lock().await;
         st.step_metadata = crate::tui::StepState::Done;
+        if let Some(t0) = st.step_metadata_started.take() {
+            st.step_metadata_elapsed = Some(t0.elapsed());
+        }
         st.step_start_vms = crate::tui::StepState::Running;
+        if st.step_start_vms_started.is_none() {
+            st.step_start_vms_started = Some(Instant::now());
+        }
         for v in st.vm_phase.values_mut() {
             *v = crate::tui::VmPhase::Starting;
         }
@@ -425,20 +456,35 @@ fn configure_agent_env(runner: &ScenarioRunner, scenario_name: &str) {
 }
 
 async fn wait_for_ssh_with_ui(ui: &crate::tui::RunUi, endpoints: &[SshEndpoint]) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     let mut remaining: HashSet<String> = endpoints.iter().map(|e| e.0.clone()).collect();
     let quit_rx = ui.quit_receiver();
+    let started_at = std::time::Instant::now();
+    let mut attempts: HashMap<String, u32> =
+        endpoints.iter().map(|e| (e.0.clone(), 0u32)).collect();
 
     while !remaining.is_empty() {
         if *quit_rx.borrow() {
             return;
         }
         for (vm_name, host, port, username, key_path) in endpoints.iter().cloned() {
-            if remaining.contains(&vm_name)
-                && try_ssh_probe(ui, &vm_name, &host, port, &username, &key_path).await
-            {
-                remaining.remove(&vm_name);
+            if remaining.contains(&vm_name) {
+                // Count attempts per-VM
+                if let Some(cnt) = attempts.get_mut(&vm_name) {
+                    *cnt += 1;
+                }
+                if try_ssh_probe(ui, &vm_name, &host, port, &username, &key_path).await {
+                    remaining.remove(&vm_name);
+                    let elapsed = started_at.elapsed();
+                    let cnt = attempts.get(&vm_name).copied().unwrap_or(0);
+                    tracing::info!(
+                        "ssh ready summary: vm='{}' elapsed={:.1}s attempts={}",
+                        vm_name,
+                        elapsed.as_secs_f32(),
+                        cnt
+                    );
+                }
             }
         }
         if !remaining.is_empty() {
@@ -581,7 +627,7 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
 
     init_file_logging_for_run(&scenario.name)?;
     let vm_names = build_vm_names(&scenario);
-    let ui = create_ui(&scenario.name, &vm_names);
+    let ui = create_ui(&scenario.name, &scenario.description, &vm_names);
     if let Some((q, who)) = crate::quotes::random_quote() {
         let mut st = ui.state.lock().await;
         st.quote = Some((q, who));
@@ -599,14 +645,7 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
         .start_all()
         .await
         .with_context(|| format!("Failed to start VMs in scenario '{name}'"))?;
-    {
-        let mut st = ui.state.lock().await;
-        st.step_start_vms = crate::tui::StepState::Done;
-        st.step_ssh = crate::tui::StepState::Running;
-        for v in st.vm_phase.values_mut() {
-            *v = crate::tui::VmPhase::SshWait;
-        }
-    }
+    mark_vms_ready_for_ssh(&ui).await;
 
     // Start probes engine early so Problems panel shows immediately
     let (probe_task, probe_state) = probes::spawn_probes_engine(&runner.scenario, &vm_names);
@@ -618,33 +657,15 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
     // Wait for SSH readiness with UI updates
     let vm_names = sorted_vm_names(&runner);
     let endpoints = collect_ssh_endpoints(&runner, &vm_names, &scenario_name).await?;
-    // Pre-populate SSH ports for UI convenience
-    {
-        let mut st = ui.state.lock().await;
-        for (vm_name, _host, port, _user, _key) in &endpoints {
-            st.vm_ssh_port.insert(vm_name.clone(), *port);
-        }
-    }
+    prepopulate_ssh_ports(&ui, &endpoints).await;
     // Wait for SSH readiness, but also honor OS Ctrl+C to stop & clean up early
     // Wait for SSH or early shutdown
-    let early_shutdown = {
-        tokio::select! {
-            // OS Ctrl+C (or TERM/HUP) during SSH wait: stop and clean up immediately
-            () = wait_for_signal() => {
-                probe_task.abort();
-                true
-            }
-            () = wait_for_ssh_with_ui(&ui, &endpoints) => { false }
-        }
-    };
+    let early_shutdown = wait_for_ssh_or_signal(&ui, &endpoints, &probe_task).await;
     if early_shutdown || ui.quit_requested() {
         // Early quit during boot (OS signal or in-TUI Ctrl+C): stop and cleanup
         return shutdown_phase(name, ui, &mut runner, hub_task, md_task, true).await;
     }
-    {
-        let mut st = ui.state.lock().await;
-        st.step_ssh = crate::tui::StepState::Done;
-    }
+    mark_ssh_done_and_complete_run(&ui).await;
 
     // Probes already running; proceed to interactive wait
 
@@ -661,6 +682,54 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
     })
     .await;
     shutdown_phase(name, ui, &mut runner, hub_task, md_task, was_tui_quit).await
+}
+
+async fn mark_vms_ready_for_ssh(ui: &crate::tui::RunUi) {
+    let mut st = ui.state.lock().await;
+    st.step_start_vms = crate::tui::StepState::Done;
+    if let Some(t0) = st.step_start_vms_started.take() {
+        st.step_start_vms_elapsed = Some(t0.elapsed());
+    }
+    st.step_ssh = crate::tui::StepState::Running;
+    if st.step_ssh_started.is_none() {
+        st.step_ssh_started = Some(Instant::now());
+    }
+    for v in st.vm_phase.values_mut() {
+        *v = crate::tui::VmPhase::SshWait;
+    }
+}
+
+async fn prepopulate_ssh_ports(ui: &crate::tui::RunUi, endpoints: &[SshEndpoint]) {
+    let mut st = ui.state.lock().await;
+    for (vm_name, _host, port, _user, _key) in endpoints {
+        st.vm_ssh_port.insert(vm_name.clone(), *port);
+    }
+}
+
+async fn wait_for_ssh_or_signal(
+    ui: &crate::tui::RunUi,
+    endpoints: &[SshEndpoint],
+    probe_task: &tokio::task::JoinHandle<()>,
+) -> bool {
+    tokio::select! {
+        // OS Ctrl+C (or TERM/HUP) during SSH wait: stop and clean up immediately
+        () = wait_for_signal() => {
+            probe_task.abort();
+            true
+        }
+        () = wait_for_ssh_with_ui(ui, endpoints) => { false }
+    }
+}
+
+async fn mark_ssh_done_and_complete_run(ui: &crate::tui::RunUi) {
+    let mut st = ui.state.lock().await;
+    st.step_ssh = crate::tui::StepState::Done;
+    if let Some(t0) = st.step_ssh_started.take() {
+        st.step_ssh_elapsed = Some(t0.elapsed());
+    }
+    if st.run_completed.is_none() {
+        st.run_completed = Some(Instant::now());
+    }
 }
 
 async fn status_scenario(name: &str) -> AnyhowResult<()> {

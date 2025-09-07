@@ -732,7 +732,6 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
-        .without_time()
         .compact()
         .try_init();
 
