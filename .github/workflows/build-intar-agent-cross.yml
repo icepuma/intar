@@ -1,0 +1,60 @@
+name: build-intar-agent-cross
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.platform.os-name }} (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os-name: Linux-x86_64-musl
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ""
+          - os-name: Linux-aarch64-musl
+            runs-on: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            ext: ""
+          - os-name: Windows-x86_64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+          - os-name: macOS-aarch64
+            runs-on: macos-14
+            target: aarch64-apple-darwin
+            ext: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build intar-agent with cross
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.platform.target }}
+          toolchain: stable
+          args: "--locked --release -p intar-agent"
+
+      - name: Upload intar-agent artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: success()
+        with:
+          name: intar-agent-${{ matrix.platform.target }}
+          path: |
+            target/${{ matrix.platform.target }}/release/intar-agent${{ matrix.platform.ext }}
+          if-no-files-found: error
+          retention-days: 7
