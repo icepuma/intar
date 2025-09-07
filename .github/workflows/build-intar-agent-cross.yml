@@ -34,3 +34,13 @@ jobs:
           target: ${{ matrix.target }}
           toolchain: stable
           args: "--locked --release -p intar-agent"
+
+      - name: Upload intar-agent artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: success()
+        with:
+          name: intar-agent-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/intar-agent
+          if-no-files-found: error
+          retention-days: 7
