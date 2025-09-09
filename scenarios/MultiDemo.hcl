@@ -6,8 +6,6 @@ Tests networking between multiple VMs in the same scenario.
 EOF
 
 image = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
-// Use locally built intar-agent for probes
-local_agent = true
 
 // Simple problem: manage a whitelisted file in the intar home
 problem "motd-welcome" {

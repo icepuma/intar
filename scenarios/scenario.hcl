@@ -1,7 +1,5 @@
 name = "Demo"
 
-local_agent = true
-
 description = <<EOF
 This is a demo scenario for testing the intar system.
 It demonstrates basic VM configuration with Ubuntu 24.04 LTS.

@@ -23,6 +23,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 glob = { workspace = true }
+rust-embed = { workspace = true }
+hcl-rs = { workspace = true }
+indexmap = { workspace = true }
+regex = "1.10.6"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default = []
