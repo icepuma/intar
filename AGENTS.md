@@ -19,6 +19,8 @@
   - You may see “multiple crate versions” warnings due to transitive deps; these are acceptable.
 - Logs: `RUST_LOG=info cargo run --bin intar -- scenario run MultiDemo`
 
+ 
+
 ## Coding Style & Naming Conventions
 - Rust 2024 edition. Use `cargo fmt` and `cargo clippy` before submitting.
 - Logging: prefer `tracing` over println/eprintln. Initialize via `tracing-subscriber` in the CLI.
@@ -71,6 +73,9 @@ Examples
 - Mark important return-value expectations with `#[must_use]` and document why when relevant.
 - When adding new features, update inline rustdoc, README, and any sample scenarios under `scenarios/`.
 - Preview docs locally with `cargo doc --no-deps` to catch warnings before submitting.
+
+## Commit Message Hygiene
+- Do not include literal `\n` sequences in commit messages; use real newlines in the body.
 
 ## Security & Configuration Tips
 - No sudo required. QEMU is the only external dependency.
