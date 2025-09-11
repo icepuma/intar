@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::Path;
 use std::{
     collections::BTreeSet,
     path::PathBuf,
@@ -8,6 +7,9 @@ use std::{
     time::Duration,
 };
 use tracing_subscriber::{EnvFilter, fmt};
+
+mod config;
+use crate::config::{ProbeDef, agent_config};
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -57,7 +59,7 @@ struct Snapshot {
     users_total: u64,
     groups_total: u64,
     file_stats: std::collections::BTreeMap<String, FileStat>,
-    sshd: Option<SshdSnapshot>,
+    settings: Vec<SettingDatum>,
 }
 
 #[derive(Clone)]
@@ -71,6 +73,12 @@ impl AgentState {
             snap: Arc::new(RwLock::new(Snapshot::default())),
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SettingDatum {
+    metric: String,
+    labels: indexmap::IndexMap<String, String>,
 }
 
 fn write_ports(out: &mut String, snap: &Snapshot) {
@@ -152,87 +160,43 @@ fn write_files(out: &mut String, snap: &Snapshot) {
     }
 }
 
-fn write_sshd(out: &mut String, s: &SshdSnapshot) {
+// Legacy sshd-specific metrics removed; superseded by generic settings extractors.
+
+fn write_settings(out: &mut String, settings: &[SettingDatum]) {
     use std::fmt::Write as _;
-    let _ = writeln!(
-        out,
-        "# TYPE intar_agent_sshd_present gauge\nintar_agent_sshd_present {}",
-        u64::from(s.present)
-    );
-    if let Some(p) = s.port {
-        let _ = writeln!(
-            out,
-            "# TYPE intar_agent_sshd_port gauge\nintar_agent_sshd_port {p}"
-        );
+    if settings.is_empty() {
+        return;
     }
-    if let Some(b) = s.password_authentication {
-        let _ = writeln!(
-            out,
-            "# TYPE intar_agent_sshd_password_authentication gauge\nintar_agent_sshd_password_authentication {}",
-            u64::from(b)
-        );
+    // Group by metric to emit one TYPE line per metric
+    let mut by_metric: indexmap::IndexMap<&str, Vec<&SettingDatum>> = indexmap::IndexMap::new();
+    for s in settings {
+        by_metric.entry(&s.metric).or_default().push(s);
     }
-    if let Some(b) = s.pubkey_authentication {
-        let _ = writeln!(
-            out,
-            "# TYPE intar_agent_sshd_pubkey_authentication gauge\nintar_agent_sshd_pubkey_authentication {}",
-            u64::from(b)
-        );
-    }
-    if let Some(mode) = &s.permit_root_login_mode {
-        let _ = writeln!(
-            out,
-            "# TYPE intar_agent_sshd_permit_root_login_mode gauge\nintar_agent_sshd_permit_root_login_mode{{mode=\"{mode}\"}} 1",
-        );
-    }
-    if let Some(b) = s.allow_tcp_forwarding {
-        let _ = writeln!(
-            out,
-            "# TYPE intar_agent_sshd_allow_tcp_forwarding gauge\nintar_agent_sshd_allow_tcp_forwarding {}",
-            u64::from(b)
-        );
-    }
-    if let Some(b) = s.x11_forwarding {
-        let _ = writeln!(
-            out,
-            "# TYPE intar_agent_sshd_x11_forwarding gauge\nintar_agent_sshd_x11_forwarding {}",
-            u64::from(b)
-        );
-    }
-    if let Some(m) = &s.gateway_ports {
-        let _ = writeln!(
-            out,
-            "# TYPE intar_agent_sshd_gateway_ports gauge\nintar_agent_sshd_gateway_ports{{mode=\"{m}\"}} 1",
-        );
-    }
-    macro_rules! list {
-        ($name:literal, $iter:expr) => {
-            let _ = writeln!(out, "# TYPE {} gauge", $name);
-            for x in $iter {
-                let _ = writeln!(out, "{}{{name=\"{}\"}} 1", $name, x);
+    for (metric, items) in by_metric {
+        let _ = writeln!(out, "# TYPE {metric} gauge");
+        for it in items {
+            // Render labels
+            let mut first = true;
+            let mut lbl = String::new();
+            for (k, v) in &it.labels {
+                if first {
+                    first = false;
+                } else {
+                    lbl.push(',');
+                }
+                let esc = v
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                let _ = write!(lbl, "{k}=\"{esc}\"");
             }
-        };
+            if lbl.is_empty() {
+                let _ = writeln!(out, "{metric} 1");
+            } else {
+                let _ = writeln!(out, "{metric}{{{lbl}}} 1");
+            }
+        }
     }
-    list!("intar_agent_sshd_kex_algorithm", s.kex_algorithms.iter());
-    list!("intar_agent_sshd_cipher", s.ciphers.iter());
-    list!("intar_agent_sshd_mac", s.macs.iter());
-    list!(
-        "intar_agent_sshd_hostkey_algorithm",
-        s.hostkey_algorithms.iter()
-    );
-    list!(
-        "intar_agent_sshd_auth_method",
-        s.authentication_methods.iter()
-    );
-    list!("intar_agent_sshd_allow_user", s.allow_users.iter());
-    list!("intar_agent_sshd_deny_user", s.deny_users.iter());
-    list!("intar_agent_sshd_allow_group", s.allow_groups.iter());
-    list!("intar_agent_sshd_deny_group", s.deny_groups.iter());
-    let _ = writeln!(
-        out,
-        "# TYPE intar_agent_sshd_has_match_blocks gauge\nintar_agent_sshd_has_match_blocks {}",
-        u64::from(s.has_match_blocks)
-    );
 }
 
 struct PortCollector;
@@ -420,28 +384,19 @@ fn read_system_file(path: &str, fixtures_root: Option<&PathBuf>) -> Result<Strin
 
 struct FilePermsCollector;
 
-// Baked-in whitelist of files to stat
-const FILE_WHITELIST: &[&str] = &[
-    "/etc/ssh/sshd_config",
-    "/etc/sudoers",
-    "/etc/passwd",
-    "/etc/shadow",
-    "/etc/hosts",
-    "/home/intar/intar.txt",
-];
-
-// Files for which we also scrape up to 255 chars of plaintext content
-const FILE_CONTENT_WHITELIST: &[&str] = &["/home/intar/intar.txt"];
-
 impl FilePermsCollector {
-    fn collect(fixtures_root: Option<&PathBuf>) -> std::collections::BTreeMap<String, FileStat> {
+    fn collect(
+        fixtures_root: Option<&PathBuf>,
+        files: &[String],
+        file_content: &[String],
+    ) -> std::collections::BTreeMap<String, FileStat> {
         let mut map: std::collections::BTreeMap<String, FileStat> =
             std::collections::BTreeMap::new();
-        for path in FILE_WHITELIST {
+        for path in files {
             let p = map_path(path, fixtures_root);
             let mut stat = stat_file(&p);
             if stat.exists
-                && FILE_CONTENT_WHITELIST.contains(path)
+                && file_content.iter().any(|f| f == path)
                 && let Ok(bytes) = std::fs::read(&p)
             {
                 let mut s = String::from_utf8_lossy(&bytes).to_string();
@@ -450,7 +405,7 @@ impl FilePermsCollector {
                 }
                 stat.content = Some(s);
             }
-            map.insert((*path).to_string(), stat);
+            map.insert(path.clone(), stat);
         }
         map
     }
@@ -461,6 +416,240 @@ fn map_path(path: &str, fixtures_root: Option<&PathBuf>) -> PathBuf {
         || PathBuf::from(path),
         |root| root.join(path.trim_start_matches('/')),
     )
+}
+
+fn expand_sources(patterns: &[String], fixtures_root: Option<&PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for pat in patterns {
+        let abs = fixtures_root.as_ref().map_or_else(
+            || PathBuf::from(pat),
+            |root| root.join(pat.trim_start_matches('/')),
+        );
+        let pattern = abs.to_string_lossy().to_string();
+        match glob::glob(&pattern) {
+            Ok(paths) => {
+                for p in paths.flatten() {
+                    out.push(p);
+                }
+            }
+            Err(_) => {
+                // Not a valid glob; just push as a path
+                out.push(PathBuf::from(pattern));
+            }
+        }
+    }
+    out
+}
+
+fn eval_probe(probe: &ProbeDef, fixtures_root: Option<&PathBuf>) -> Result<Vec<SettingDatum>> {
+    match probe {
+        ProbeDef::KvList {
+            sources,
+            entry_regex,
+            split_regex,
+            include_keys,
+            metric,
+            labels,
+        } => eval_file_kv_list(
+            sources,
+            entry_regex,
+            split_regex.as_deref().unwrap_or("[,\\s]+"),
+            include_keys,
+            metric.as_deref().unwrap_or("intar_agent_setting"),
+            labels,
+            fixtures_root,
+        ),
+        ProbeDef::Kv {
+            sources,
+            entry_regex,
+            include_keys,
+            metric,
+            labels,
+        } => eval_file_kv(
+            sources,
+            entry_regex,
+            include_keys,
+            metric.as_deref().unwrap_or("intar_agent_setting"),
+            labels,
+            fixtures_root,
+        ),
+        ProbeDef::Table {
+            source,
+            delimiter,
+            columns,
+            key_column,
+            value_columns,
+            metric,
+            labels,
+        } => {
+            let path = map_path(source, fixtures_root);
+            eval_file_table(
+                &path,
+                delimiter,
+                columns,
+                key_column,
+                value_columns,
+                metric.as_deref().unwrap_or("intar_agent_setting"),
+                labels,
+            )
+        }
+    }
+}
+
+fn eval_file_kv_list(
+    sources: &[String],
+    entry_regex: &str,
+    split_regex: &str,
+    include_keys: &[String],
+    metric: &str,
+    static_labels: &indexmap::IndexMap<String, String>,
+    fixtures_root: Option<&PathBuf>,
+) -> Result<Vec<SettingDatum>> {
+    let mut out = Vec::new();
+    let re = regex::Regex::new(entry_regex).context("invalid entry_regex")?;
+    let split_re = regex::Regex::new(split_regex).context("invalid split_regex")?;
+    let files = expand_sources(sources, fixtures_root);
+    for f in files {
+        if !f.is_file() {
+            continue;
+        }
+        let s = std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?;
+        for line in s.lines() {
+            if let Some(caps) = re.captures(line) {
+                let key = caps.name("key").map(|m| m.as_str().to_string());
+                if let Some(k) = &key
+                    && !include_keys.is_empty()
+                    && !include_keys.iter().any(|ik| ik.eq_ignore_ascii_case(k))
+                {
+                    continue;
+                }
+                let values = caps.name("values").map_or("", |m| m.as_str());
+                for v in split_re.split(values) {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        continue;
+                    }
+                    let mut labels = static_labels.clone();
+                    labels.insert("path".to_string(), f.to_string_lossy().to_string());
+                    if let Some(k) = &key {
+                        labels.insert("key".to_string(), k.clone());
+                    }
+                    labels.insert("value".to_string(), v.to_string());
+                    out.push(SettingDatum {
+                        metric: metric.to_string(),
+                        labels,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn eval_file_kv(
+    sources: &[String],
+    entry_regex: &str,
+    include_keys: &[String],
+    metric: &str,
+    static_labels: &indexmap::IndexMap<String, String>,
+    fixtures_root: Option<&PathBuf>,
+) -> Result<Vec<SettingDatum>> {
+    let mut out = Vec::new();
+    let re = regex::Regex::new(entry_regex).context("invalid entry_regex")?;
+    let files = expand_sources(sources, fixtures_root);
+    for f in files {
+        if !f.is_file() {
+            continue;
+        }
+        let s = std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?;
+        for line in s.lines() {
+            if let Some(caps) = re.captures(line) {
+                let key = caps.name("key").map(|m| m.as_str().to_string());
+                if let Some(k) = &key
+                    && !include_keys.is_empty()
+                    && !include_keys.iter().any(|ik| ik.eq_ignore_ascii_case(k))
+                {
+                    continue;
+                }
+                let value = caps.name("value").map_or("", |m| m.as_str().trim());
+                if value.is_empty() {
+                    continue;
+                }
+                let mut labels = static_labels.clone();
+                labels.insert("path".to_string(), f.to_string_lossy().to_string());
+                if let Some(k) = key {
+                    labels.insert("key".to_string(), k);
+                }
+                labels.insert("value".to_string(), value.to_string());
+                out.push(SettingDatum {
+                    metric: metric.to_string(),
+                    labels,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn eval_file_table(
+    path: &PathBuf,
+    delimiter: &str,
+    columns: &[String],
+    key_column: &str,
+    value_columns: &[String],
+    metric: &str,
+    static_labels: &indexmap::IndexMap<String, String>,
+) -> Result<Vec<SettingDatum>> {
+    let mut out = Vec::new();
+    if !path.is_file() {
+        return Ok(out);
+    }
+    let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let key_idx = columns
+        .iter()
+        .position(|c| c == key_column)
+        .context("key_column not found in columns")?;
+    let val_idxs: Vec<(usize, &str)> = value_columns
+        .iter()
+        .map(|c| {
+            let idx = columns
+                .iter()
+                .position(|cc| cc == c)
+                .with_context(|| format!("value column '{c}' not in columns"))?;
+            Ok((idx, c.as_str()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for raw in s.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = if delimiter == "whitespace" {
+            line.split_whitespace().collect()
+        } else {
+            line.split(delimiter).collect()
+        };
+        if parts.len() < columns.len() {
+            continue;
+        }
+        let keyv = parts[key_idx].trim();
+        for (idx, colname) in &val_idxs {
+            let v = parts[*idx].trim();
+            if v.is_empty() {
+                continue;
+            }
+            let mut labels = static_labels.clone();
+            labels.insert("path".to_string(), path.to_string_lossy().to_string());
+            labels.insert("key".to_string(), keyv.to_string());
+            labels.insert("column".to_string(), (*colname).to_string());
+            labels.insert("value".to_string(), v.to_string());
+            out.push(SettingDatum {
+                metric: metric.to_string(),
+                labels,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn stat_file(p: &PathBuf) -> FileStat {
@@ -510,220 +699,7 @@ fn stat_file(p: &PathBuf) -> FileStat {
     }
 }
 
-// ---------------------
-// sshd collector
-// ---------------------
-
-#[derive(Default, Clone, Debug)]
-struct SshdSnapshot {
-    present: bool,
-    port: Option<u16>,
-    permit_root_login_mode: Option<String>,
-    password_authentication: Option<bool>,
-    pubkey_authentication: Option<bool>,
-    kex_algorithms: Vec<String>,
-    ciphers: Vec<String>,
-    macs: Vec<String>,
-    hostkey_algorithms: Vec<String>,
-    allow_tcp_forwarding: Option<bool>,
-    x11_forwarding: Option<bool>,
-    gateway_ports: Option<String>,
-    max_auth_tries: Option<u64>,
-    max_sessions: Option<u64>,
-    client_alive_interval: Option<u64>,
-    client_alive_count_max: Option<u64>,
-    use_pam: Option<bool>,
-    banner_present: Option<bool>,
-    authentication_methods: Vec<String>,
-    allow_users: Vec<String>,
-    deny_users: Vec<String>,
-    allow_groups: Vec<String>,
-    deny_groups: Vec<String>,
-    has_match_blocks: bool,
-}
-
-struct SshdCollector;
-
-impl SshdCollector {
-    fn collect(fixtures_root: Option<&PathBuf>) -> Result<SshdSnapshot> {
-        let main_path = map_path("/etc/ssh/sshd_config", fixtures_root);
-        if !main_path.exists() {
-            return Ok(SshdSnapshot {
-                present: false,
-                ..SshdSnapshot::default()
-            });
-        }
-        let mut visited = std::collections::BTreeSet::new();
-        let mut snap = SshdSnapshot {
-            present: true,
-            ..SshdSnapshot::default()
-        };
-        Self::parse_file(
-            &main_path,
-            &mut snap,
-            fixtures_root,
-            &mut visited,
-            &mut false,
-        )?;
-        Ok(snap)
-    }
-
-    fn parse_file(
-        path: &PathBuf,
-        snap: &mut SshdSnapshot,
-        fixtures_root: Option<&PathBuf>,
-        visited: &mut std::collections::BTreeSet<PathBuf>,
-        in_match: &mut bool,
-    ) -> Result<()> {
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-        if !visited.insert(canon.clone()) {
-            return Ok(()); // avoid cycles
-        }
-        let s = std::fs::read_to_string(&canon)
-            .with_context(|| format!("Failed to read {}", canon.display()))?;
-        let base_dir = canon
-            .parent()
-            .map_or_else(|| PathBuf::from("/"), PathBuf::from);
-
-        for raw_line in s.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            let key = match parts.next() {
-                Some(k) => k.to_ascii_lowercase(),
-                None => continue,
-            };
-            let value = parts.collect::<Vec<_>>().join(" ");
-
-            if key == "match" {
-                snap.has_match_blocks = true;
-                *in_match = true;
-                continue;
-            }
-            if *in_match {
-                continue;
-            }
-
-            match key.as_str() {
-                "include" => {
-                    for pat in value.split_whitespace() {
-                        for inc in resolve_include_paths(pat, &base_dir, fixtures_root) {
-                            if inc.is_file() {
-                                let _ =
-                                    Self::parse_file(&inc, snap, fixtures_root, visited, in_match);
-                            }
-                        }
-                    }
-                }
-                "port" => {
-                    if let Ok(p) = value.trim().parse::<u16>() {
-                        snap.port = Some(p);
-                    }
-                }
-                "permitrootlogin" => {
-                    snap.permit_root_login_mode = Some(value.to_ascii_lowercase());
-                }
-                "passwordauthentication" => snap.password_authentication = parse_bool(&value),
-                "pubkeyauthentication" => snap.pubkey_authentication = parse_bool(&value),
-                "kexalgorithms" => snap.kex_algorithms = parse_list(&value),
-                "ciphers" => snap.ciphers = parse_list(&value),
-                "macs" => snap.macs = parse_list(&value),
-                "hostkeyalgorithms" => snap.hostkey_algorithms = parse_list(&value),
-                "allowtcpforwarding" => snap.allow_tcp_forwarding = parse_bool(&value),
-                "x11forwarding" => snap.x11_forwarding = parse_bool(&value),
-                "gatewayports" => snap.gateway_ports = Some(value.to_ascii_lowercase()),
-                "maxauthtries" => snap.max_auth_tries = value.trim().parse::<u64>().ok(),
-                "maxsessions" => snap.max_sessions = value.trim().parse::<u64>().ok(),
-                "clientaliveinterval" => {
-                    snap.client_alive_interval = value.trim().parse::<u64>().ok();
-                }
-                "clientalivecountmax" => {
-                    snap.client_alive_count_max = value.trim().parse::<u64>().ok();
-                }
-                "usepam" => snap.use_pam = parse_bool(&value),
-                "banner" => {
-                    let v = value.trim();
-                    if !v.is_empty() && !v.eq_ignore_ascii_case("none") {
-                        snap.banner_present = Some(true);
-                    } else {
-                        snap.banner_present = Some(false);
-                    }
-                }
-                "authenticationmethods" => {
-                    snap.authentication_methods = parse_auth_methods(&value);
-                }
-                "allowusers" => snap.allow_users = parse_space_list(&value),
-                "denyusers" => snap.deny_users = parse_space_list(&value),
-                "allowgroups" => snap.allow_groups = parse_space_list(&value),
-                "denygroups" => snap.deny_groups = parse_space_list(&value),
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-}
-
-fn resolve_include_paths(
-    pattern: &str,
-    base_dir: &Path,
-    fixtures_root: Option<&PathBuf>,
-) -> Vec<PathBuf> {
-    use glob::glob;
-    let pat_path = if PathBuf::from(pattern).is_absolute() {
-        fixtures_root.as_ref().map_or_else(
-            || PathBuf::from(pattern),
-            |root| root.join(pattern.trim_start_matches('/')),
-        )
-    } else {
-        base_dir.join(pattern)
-    };
-    let pat_str = pat_path.to_string_lossy().to_string();
-    let mut v = Vec::new();
-    if let Ok(paths) = glob(&pat_str) {
-        for entry in paths.flatten() {
-            v.push(entry);
-        }
-    }
-    v
-}
-
-fn parse_bool(s: &str) -> Option<bool> {
-    let v = s.trim().to_ascii_lowercase();
-    match v.as_str() {
-        "yes" | "on" | "true" | "1" => Some(true),
-        "no" | "off" | "false" | "0" => Some(false),
-        _ => None,
-    }
-}
-
-fn parse_list(s: &str) -> Vec<String> {
-    s.split(',')
-        .map(|x| x.trim().to_string())
-        .filter(|x| !x.is_empty())
-        .collect()
-}
-
-fn parse_space_list(s: &str) -> Vec<String> {
-    s.split_whitespace()
-        .map(|x| x.trim().to_string())
-        .filter(|x| !x.is_empty())
-        .collect()
-}
-
-fn parse_auth_methods(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for part in s.split_whitespace() {
-        for sub in part.split(',') {
-            let t = sub.trim();
-            if !t.is_empty() {
-                out.push(t.to_string());
-            }
-        }
-    }
-    out
-}
+// Legacy sshd collector removed. Generic file extractors supersede sshd-specific parsing.
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -782,18 +758,32 @@ async fn main() -> Result<()> {
     let interval = cfg.interval;
 
     let collect_once = || -> Result<()> {
-        let ports = PortCollector::collect(fixtures.as_ref());
-        let (user_groups, users_total, groups_total) =
-            UsersGroupsCollector::collect(fixtures.as_ref()).context("collect users/groups")?;
-        let file_stats = FilePermsCollector::collect(fixtures.as_ref());
-        let sshd = SshdCollector::collect(fixtures.as_ref()).context("collect sshd")?;
+        let cfg = agent_config().clone();
+        let ports = if cfg.collect_ports {
+            PortCollector::collect(fixtures.as_ref())
+        } else {
+            BTreeSet::new()
+        };
+        let (user_groups, users_total, groups_total) = if cfg.collect_users_groups {
+            UsersGroupsCollector::collect(fixtures.as_ref()).context("collect users/groups")?
+        } else {
+            (BTreeSet::new(), 0, 0)
+        };
+        let file_stats =
+            FilePermsCollector::collect(fixtures.as_ref(), &cfg.files, &cfg.file_content);
+        // Evaluate generic file extractors from embedded config
+        let mut settings = Vec::new();
+        for probe in cfg.probes.values() {
+            let mut items = eval_probe(probe, fixtures.as_ref())?;
+            settings.append(&mut items);
+        }
         if let Ok(mut snap) = state.snap.write() {
             snap.open_ports = ports;
             snap.user_groups = user_groups;
             snap.users_total = users_total;
             snap.groups_total = groups_total;
             snap.file_stats = file_stats;
-            snap.sshd = Some(sshd);
+            snap.settings = settings;
         }
         Ok(())
     };
@@ -836,9 +826,7 @@ fn render_prometheus(state: &AgentState) -> String {
         write_ports(&mut out, &snap);
         write_users_groups(&mut out, &snap);
         write_files(&mut out, &snap);
-        if let Some(sshd) = &snap.sshd {
-            write_sshd(&mut out, sshd);
-        }
+        write_settings(&mut out, &snap.settings);
     }
     out
 }
@@ -846,6 +834,8 @@ fn render_prometheus(state: &AgentState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
+    use tempfile::TempDir;
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/debian")
@@ -888,42 +878,143 @@ mod tests {
         );
     }
 
+    // Legacy sshd collector test removed; generic file extractors cover ciphers/MACs/KEX via files.
+
     #[test]
-    fn test_sshd_collector_fixtures() {
-        let root = Some(fixture_root());
-        let sshd = SshdCollector::collect(root.as_ref()).expect("collect sshd");
-        assert!(sshd.present);
-        assert_eq!(sshd.port, Some(2222));
-        assert_eq!(sshd.password_authentication, Some(false));
-        assert_eq!(sshd.pubkey_authentication, Some(true));
-        assert_eq!(
-            sshd.permit_root_login_mode.as_deref(),
-            Some("prohibit-password")
-        );
-        assert_eq!(sshd.allow_tcp_forwarding, Some(false));
-        assert_eq!(sshd.x11_forwarding, Some(false));
-        assert_eq!(sshd.gateway_ports.as_deref(), Some("clientspecified"));
-        assert_eq!(sshd.max_auth_tries, Some(3));
-        assert_eq!(sshd.max_sessions, Some(10));
-        assert_eq!(sshd.client_alive_interval, Some(30));
-        assert_eq!(sshd.client_alive_count_max, Some(2));
-        assert_eq!(sshd.use_pam, Some(true));
-        assert_eq!(sshd.banner_present, Some(true));
-        assert!(sshd.kex_algorithms.iter().any(|k| k.contains("curve25519")));
-        assert!(sshd.ciphers.iter().any(|c| c.contains("chacha20")));
-        assert!(sshd.macs.iter().any(|m| m.contains("hmac-sha2")));
-        assert!(
-            sshd.hostkey_algorithms
-                .iter()
-                .any(|h| h.contains("ssh-ed25519"))
-        );
-        assert!(
-            sshd.authentication_methods
-                .iter()
-                .any(|a| a.contains("publickey"))
-        );
-        assert!(sshd.allow_users.iter().any(|u| u == "alice"));
-        assert!(sshd.allow_groups.iter().any(|g| g == "sudo"));
-        assert!(sshd.has_match_blocks);
+    fn test_file_kv_list_sshd_ciphers_from_files() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let cfg_dir = root.join("etc/ssh/sshd_config.d");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(root.join("etc/ssh")).unwrap();
+        std::fs::write(
+            root.join("etc/ssh/sshd_config"),
+            "Include /etc/ssh/sshd_config.d/*.conf\nCiphers aes256-gcm@openssh.com\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg_dir.join("10-extra.conf"),
+            "# extra\nCiphers chacha20-poly1305@openssh.com\n",
+        )
+        .unwrap();
+
+        let mut labels: IndexMap<String, String> = IndexMap::new();
+        labels.insert("subsystem".into(), "sshd".into());
+        let probe = ProbeDef::KvList {
+            sources: vec![
+                "/etc/ssh/sshd_config".into(),
+                "/etc/ssh/sshd_config.d/*.conf".into(),
+            ],
+            entry_regex: "^\\s*(?P<key>[A-Za-z][A-Za-z0-9]+)\\s+(?P<values>.+)$".into(),
+            split_regex: Some("[,\\s]+".into()),
+            include_keys: vec!["Ciphers".into()],
+            metric: Some("intar_agent_setting".into()),
+            labels,
+        };
+
+        let out = eval_probe(&probe, Some(&root.to_path_buf())).expect("eval");
+        let mut values: Vec<String> = out
+            .iter()
+            .filter_map(|d| d.labels.get("value").cloned())
+            .collect();
+        values.sort();
+        assert!(values.contains(&"aes256-gcm@openssh.com".to_string()));
+        assert!(values.contains(&"chacha20-poly1305@openssh.com".to_string()));
+    }
+
+    #[test]
+    fn test_render_includes_intar_agent_setting() {
+        // Build settings and verify they are rendered as Prometheus lines.
+        let mut labels1: IndexMap<String, String> = IndexMap::new();
+        labels1.insert("subsystem".into(), "sshd".into());
+        labels1.insert("key".into(), "Ciphers".into());
+        labels1.insert("value".into(), "chacha20-poly1305@openssh.com".into());
+        let mut labels2 = labels1.clone();
+        labels2.insert("value".into(), "aes256-gcm@openssh.com".into());
+
+        let state = AgentState::new();
+        if let Ok(mut snap) = state.snap.write() {
+            snap.settings = vec![
+                SettingDatum {
+                    metric: "intar_agent_setting".into(),
+                    labels: labels1,
+                },
+                SettingDatum {
+                    metric: "intar_agent_setting".into(),
+                    labels: labels2,
+                },
+            ];
+        }
+        let out = render_prometheus(&state);
+        assert!(out.contains("# TYPE intar_agent_setting gauge"));
+        assert!(out.contains("value=\"chacha20-poly1305@openssh.com\""));
+        assert!(out.contains("value=\"aes256-gcm@openssh.com\""));
+    }
+
+    #[test]
+    fn test_file_kv_resolv_nameservers() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(
+            root.join("etc/resolv.conf"),
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+        )
+        .unwrap();
+        let mut labels: IndexMap<String, String> = IndexMap::new();
+        labels.insert("subsystem".into(), "resolv".into());
+        let probe = ProbeDef::Kv {
+            sources: vec!["/etc/resolv.conf".into()],
+            entry_regex: "^(?i)(?P<key>nameserver)\\s+(?P<value>\\S+)".into(),
+            include_keys: vec!["nameserver".into()],
+            metric: Some("intar_agent_setting".into()),
+            labels,
+        };
+        let out = eval_probe(&probe, Some(&root.to_path_buf())).expect("eval");
+        let mut values: Vec<String> = out
+            .iter()
+            .filter_map(|d| d.labels.get("value").cloned())
+            .collect();
+        values.sort();
+        assert_eq!(values, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
+    }
+
+    #[test]
+    fn test_file_table_fstab() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let fstab = "# <file systems>\n/dev/sda1 / ext4 defaults 0 1\n/dev/sdb1 /mnt/data ext4 defaults 0 2\n";
+        std::fs::write(root.join("etc/fstab"), fstab).unwrap();
+        let mut labels: IndexMap<String, String> = IndexMap::new();
+        labels.insert("subsystem".into(), "fstab".into());
+        let probe = ProbeDef::Table {
+            source: "/etc/fstab".into(),
+            delimiter: "whitespace".into(),
+            columns: vec![
+                "spec".into(),
+                "file".into(),
+                "vfs".into(),
+                "options".into(),
+                "dump".into(),
+                "pass".into(),
+            ],
+            key_column: "file".into(),
+            value_columns: vec!["vfs".into(), "options".into()],
+            metric: Some("intar_agent_setting".into()),
+            labels,
+        };
+        let out = eval_probe(&probe, Some(&root.to_path_buf())).expect("eval");
+        // Expect entries for /mnt/data ext4 and defaults
+        assert!(out.iter().any(|d| {
+            d.labels.get("key").is_some_and(|v| v == "/mnt/data")
+                && d.labels.get("column").is_some_and(|c| c == "vfs")
+                && d.labels.get("value").is_some_and(|v| v == "ext4")
+        }));
+        assert!(out.iter().any(|d| {
+            d.labels.get("key").is_some_and(|v| v == "/mnt/data")
+                && d.labels.get("column").is_some_and(|c| c == "options")
+                && d.labels.get("value").is_some_and(|v| v == "defaults")
+        }));
     }
 }

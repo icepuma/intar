@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
@@ -61,6 +62,12 @@ pub trait BackendVm: Send + Sync {
 
     /// Cleanup VM resources (destructive)
     async fn cleanup(&self) -> Result<()>;
+
+    /// Create a VM snapshot with the given name (best-effort).
+    async fn snapshot_save(&self, name: &str) -> Result<()>;
+
+    /// Restore a VM snapshot with the given name (pauses, loads, then resumes).
+    async fn snapshot_restore(&self, name: &str) -> Result<()>;
 }
 
 /// Backend interface for managing VM scenarios
@@ -149,20 +156,14 @@ impl Backend for LocalBackend {
             .await
             .context("Failed to generate SSH keys for scenario")?;
 
-        // Compute a cache filename based on URL hash to avoid collisions
-        let url = scenario.image.clone();
-        let last_seg = url.split('/').next_back().unwrap_or("");
-        let ext = last_seg
-            .rsplit('.')
-            .next()
-            .filter(|s| !s.is_empty() && *s != last_seg);
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(url.as_bytes());
-        let url_hash = hex::encode(hasher.finalize());
-        let filename = ext.map_or_else(
-            || format!("{url_hash}.qcow2"),
-            |e| format!("{url_hash}.{e}"),
-        );
+        // Save images "as is" in the cache dir using the original filename
+        let last_seg = scenario.image.split('/').next_back().unwrap_or("");
+        // If URL lacks an extension, default to .qcow2 to keep qemu-img happy
+        let filename = if last_seg.contains('.') {
+            last_seg.to_string()
+        } else {
+            format!("{last_seg}.qcow2")
+        };
         let image_path = self.dirs.cached_image_path(&filename);
 
         if !image_path.exists() {
@@ -183,20 +184,67 @@ impl Backend for LocalBackend {
                     .context("Failed to create image cache directory")?;
             }
 
+            // Progress file in runtime dir for the TUI to consume
+            let progress_path = self
+                .dirs
+                .runtime_scenario_dir(&scenario.name)
+                .join("image-download.json");
+            if let Some(parent) = progress_path.parent() {
+                let _ = self.dirs.ensure_dir(parent).await;
+            }
+
             // Stream to a temporary file, compute SHA256 on the fly
             let part_path = image_path.with_extension(format!("part-{}", uuid::Uuid::new_v4()));
             let mut file = File::create(&part_path)
                 .await
                 .with_context(|| format!("Failed to create image file: {}", part_path.display()))?;
 
+            let total_opt = response.content_length();
             let mut stream = response.bytes_stream();
             let mut hasher = sha2::Sha256::new();
+            let mut downloaded: u64 = 0;
+            let mut last_emit = Instant::now();
+            // Emit initial progress
+            {
+                let _ = tokio::fs::write(
+                    &progress_path,
+                    serde_json::json!({
+                        "total": total_opt,
+                        "downloaded": downloaded,
+                        "percent": total_opt.map(|_| 0u64),
+                    })
+                    .to_string(),
+                )
+                .await;
+            }
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.context("Failed to download image chunk")?;
                 hasher.update(&chunk);
                 file.write_all(&chunk)
                     .await
                     .context("Failed to write image data")?;
+                downloaded = downloaded.saturating_add(u64::try_from(chunk.len()).unwrap_or(0));
+                // Throttle progress updates
+                if last_emit.elapsed().as_millis() >= 200 {
+                    let percent = total_opt.map(|t| {
+                        if t > 0 {
+                            (downloaded.saturating_mul(100) / t).min(100)
+                        } else {
+                            0
+                        }
+                    });
+                    let _ = tokio::fs::write(
+                        &progress_path,
+                        serde_json::json!({
+                            "total": total_opt,
+                            "downloaded": downloaded,
+                            "percent": percent,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                    last_emit = Instant::now();
+                }
             }
 
             // Verify checksum if provided
@@ -206,6 +254,7 @@ impl Backend for LocalBackend {
                 if actual_hex.to_lowercase() != expected_hex.trim().to_lowercase() {
                     // Remove partial
                     let _ = tokio::fs::remove_file(&part_path).await;
+                    let _ = tokio::fs::remove_file(&progress_path).await;
                     anyhow::bail!(
                         "Image checksum mismatch. expected={}, actual={}",
                         expected_hex,
@@ -226,6 +275,9 @@ impl Backend for LocalBackend {
                 })?;
 
             tracing::info!("Base image downloaded: {}", image_path.display());
+
+            // Finalize progress: remove file or mark 100%
+            let _ = tokio::fs::remove_file(&progress_path).await;
         }
 
         Ok(())
@@ -281,20 +333,14 @@ impl Backend for LocalBackend {
         .context("Failed to create VM")?;
 
         // Set the base image from the scenario
-        let image_filename = scenario
-            .image
-            .split('/')
-            .next_back()
-            .unwrap_or("base-image")
-            .to_string();
-
-        let image_filename = if image_filename.contains('.') {
-            image_filename
+        // Use the original filename in cache for the VM base image
+        let last_seg = scenario.image.split('/').next_back().unwrap_or("");
+        let filename = if last_seg.contains('.') {
+            last_seg.to_string()
         } else {
-            format!("{image_filename}.qcow2")
+            format!("{last_seg}.qcow2")
         };
-
-        let image_path = self.dirs.cached_image_path(&image_filename);
+        let image_path = self.dirs.cached_image_path(&filename);
         vm.set_base_image(image_path);
 
         Ok(Box::new(VmWrapper {
@@ -449,6 +495,10 @@ pub struct VmWrapper {
     inner: Arc<Mutex<crate::vm::Vm>>,
 }
 
+impl VmWrapper {
+    // snapshot helper methods removed; we now rely on HMP savevm/loadvm directly
+}
+
 #[async_trait]
 impl BackendVm for VmWrapper {
     async fn name(&self) -> String {
@@ -517,5 +567,59 @@ impl BackendVm for VmWrapper {
     async fn cleanup(&self) -> Result<()> {
         let mut vm = self.inner.lock().await;
         vm.cleanup().await
+    }
+
+    async fn snapshot_save(&self, _name: &str) -> Result<()> {
+        use crate::qmp::QmpClient;
+        let (qmp_socket, vm_name) = {
+            let vm = self.inner.lock().await;
+            (vm.qmp_socket.clone(), vm.name.clone())
+        };
+        let mut client = QmpClient::connect(&qmp_socket).await.with_context(|| {
+            format!(
+                "Failed to connect QMP for live snapshot-save '{}': {}",
+                vm_name,
+                qmp_socket.display()
+            )
+        })?;
+        let tag = "snapshot".to_string();
+
+        // Use HMP savevm directly; prior fallbacks (vmstate devices, QMP jobs) were unreliable
+        client
+            .savevm(&tag)
+            .await
+            .with_context(|| "HMP savevm failed")?;
+
+        let _ = client.close().await;
+        tracing::info!("snapshot-save concluded for VM {} (tag='{}')", vm_name, tag);
+        Ok(())
+    }
+
+    async fn snapshot_restore(&self, _name: &str) -> Result<()> {
+        use crate::qmp::QmpClient;
+        let (qmp_socket, vm_name) = {
+            let vm = self.inner.lock().await;
+            (vm.qmp_socket.clone(), vm.name.clone())
+        };
+        let mut client = QmpClient::connect(&qmp_socket).await.with_context(|| {
+            format!(
+                "Failed to connect QMP for live restore '{}': {}",
+                vm_name,
+                qmp_socket.display()
+            )
+        })?;
+        let tag = "snapshot".to_string();
+
+        // Use HMP loadvm directly; prior fallbacks (vmstate devices, QMP jobs) were unreliable
+        client
+            .loadvm(&tag)
+            .await
+            .with_context(|| "HMP loadvm failed")?;
+
+        // Resume in case restore leaves VM paused
+        let _ = client.cont_vm().await;
+        let _ = client.close().await;
+        tracing::info!("snapshot-load concluded for VM {} (tag='{}')", vm_name, tag);
+        Ok(())
     }
 }

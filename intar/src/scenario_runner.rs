@@ -3,6 +3,7 @@ use futures_util::future::try_join_all;
 use intar_scenario::Scenario;
 use std::collections::HashMap;
 
+use crate::IntarDirs;
 use intar_local_backend::{Backend, BackendVm, LocalBackend, VmStatus};
 
 /// Orchestrates backend operations for a scenario (prepare, start/stop, status, cleanup).
@@ -230,18 +231,68 @@ impl Drop for ScenarioRunner {
     fn drop(&mut self) {
         let vm_count = self.vms.len();
         if vm_count > 0 {
+            let scenario = &self.scenario.name;
             tracing::warn!(
-                "ScenarioRunner dropped with {} VMs potentially running; ensure proper shutdown/cleanup",
+                "Scenario '{}' dropped with {} VMs potentially running.",
+                scenario,
                 vm_count
             );
-            for vm_name in self.vms.keys() {
-                tracing::warn!(
-                    "VM '{}' may still be running; ssh via: intar scenario ssh {} {}",
-                    vm_name,
-                    self.scenario.name,
-                    vm_name
-                );
+
+            // Provide useful paths and next steps
+            if let Ok(dirs) = IntarDirs::new() {
+                let data_dir = dirs.data_scenario_dir(scenario);
+                let runtime_dir = dirs.runtime_scenario_dir(scenario);
+                tracing::warn!("Data dir: {}", data_dir.display());
+                tracing::warn!("Runtime dir: {}", runtime_dir.display());
+                tracing::warn!("Inspect status: intar scenario status {}", scenario);
             }
+
+            // Log per‑VM hints: ssh command, PID/QMP/log locations (if present)
+            let mut names: Vec<&String> = self.vms.keys().collect();
+            names.sort();
+            if let Ok(dirs) = IntarDirs::new() {
+                for vm_name in names {
+                    let pid_path = dirs.vm_pid_file(scenario, vm_name);
+                    let qmp_path = dirs.vm_qmp_socket(scenario, vm_name);
+                    let log_path = dirs.vm_log_file(scenario, vm_name);
+                    let console_path = dirs.vm_console_log_file(scenario, vm_name);
+
+                    // Try to read PID for convenience
+                    let pid_suffix = std::fs::read_to_string(&pid_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(|pid| format!(" (PID: {pid})"))
+                        .unwrap_or_default();
+
+                    tracing::warn!(
+                        "VM '{}' may still be running{}; ssh: intar scenario ssh {} {}",
+                        vm_name,
+                        pid_suffix,
+                        scenario,
+                        vm_name
+                    );
+                    tracing::warn!("  PID file: {}", pid_path.display());
+                    tracing::warn!(
+                        "  QMP socket: {} (echo 'quit' | socat - UNIX-CONNECT:{})",
+                        qmp_path.display(),
+                        qmp_path.display()
+                    );
+                    tracing::warn!("  Log: {}", log_path.display());
+                    tracing::warn!("  Console: {}", console_path.display());
+                }
+            } else {
+                for vm_name in self.vms.keys() {
+                    tracing::warn!(
+                        "VM '{}' may still be running; ssh: intar scenario ssh {} {}",
+                        vm_name,
+                        scenario,
+                        vm_name
+                    );
+                }
+            }
+            tracing::warn!(
+                "To force stop: kill the QEMU PID shown above or send QMP 'quit' to the socket."
+            );
         }
     }
 }

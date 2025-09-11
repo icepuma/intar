@@ -661,7 +661,7 @@ mod tests {
     fn user_data_contains_hosts_and_sshkey() {
         let dirs = IntarDirs::new().expect("dirs");
         let cfg = CloudInitConfig::new(CloudInitSpec {
-            scenario_name: "MultiDemo".into(),
+            scenario_name: "multiple-rocky-linux-vms".into(),
             vm_name: "web".into(),
             dirs,
             ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA".into(),
@@ -682,7 +682,7 @@ mod tests {
         assert!(user.contains("ssh_authorized_keys"));
         // hosts file line for db should be present
         assert!(
-            user.contains("db db-MultiDemo db.MultiDemo"),
+            user.contains("db db-multiple-rocky-linux-vms db.multiple-rocky-linux-vms"),
             "user-data={user}",
         );
     }
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn scenario_id_is_in_range() {
-        for name in &["a", "b", "MultiDemo", "x"] {
+        for name in &["a", "b", "multiple-rocky-linux-vms", "x"] {
             let id = calculate_scenario_id(name);
             assert!((1..=254).contains(&id));
         }

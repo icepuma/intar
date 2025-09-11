@@ -2,6 +2,10 @@
 resolver = "3"
 members = ["intar", "intar-scenario", "intar-local-backend", "intar-agent"]
 
+[profile.release.package.intar-agent]
+opt-level = "z"
+debug = 0
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

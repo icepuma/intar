@@ -605,7 +605,7 @@ impl Vm {
         let (user_netdev, user_device, lan_netdev, lan_device) = self.network_arg_strings();
         // Prefer safe performance flags: writeback cache, threaded AIO (portable), and discard for trim support
         let drive_config = format!(
-            "file={},if=virtio,format=qcow2,cache=writeback,aio=threads,discard=unmap",
+            "file={},if=virtio,format=qcow2,cache=writeback,aio=threads,discard=unmap,id=disk0",
             self.disk_path.display()
         );
         let qmp_config = format!("unix:{},server,nowait", self.qmp_socket.display());
@@ -615,6 +615,33 @@ impl Vm {
             (&user_netdev, &user_device, &lan_netdev, &lan_device),
         );
         qemu_args.extend(self.qemu_config.accel_args.clone());
+
+        // Add a dedicated vmstate backend nodes using -blockdev (stable node-names)
+        let vmstate_path = self
+            .dirs
+            .runtime_vm_dir(&self.scenario_name, &self.name)
+            .join("vmstate.bin");
+        if let Some(parent) = vmstate_path.parent() {
+            self.dirs
+                .ensure_dir(parent)
+                .await
+                .with_context(|| format!("Failed to create runtime dir: {}", parent.display()))?;
+        }
+        let _ = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&vmstate_path)
+            .await;
+        // file node
+        qemu_args.push("-blockdev".into());
+        qemu_args.push(format!(
+            "driver=file,filename={},node-name=vmstate.file",
+            vmstate_path.display()
+        ));
+        // raw wrapper node (this is what snapshot-save/load should reference)
+        qemu_args.push("-blockdev".into());
+        qemu_args.push("driver=raw,file=vmstate.file,node-name=vmstate".into());
 
         // Create command running QEMU directly
         let mut cmd = Command::new(&self.qemu_config.binary);

@@ -15,16 +15,20 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use intar::IntarDirs;
 use ratatui::prelude::{
     Alignment, Color, Constraint, Direction, Layout, Line, Modifier, Rect, Span, Style,
 };
 use ratatui::widgets::block::Padding;
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::stdout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
+
+// (tiles view removed; now using a table view for VMs)
 
 /// High-level step state for the boot sequence.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,10 +56,12 @@ pub struct UiState {
     pub run_completed: Option<Instant>,
     pub quote: Option<(String, String)>, // (text, person)
     pub step_prepare: StepState,
+    pub step_download: StepState,
     pub step_hub: StepState,
     pub step_metadata: StepState,
     pub step_start_vms: StepState,
     pub step_ssh: StepState,
+    pub step_snapshot: StepState,
     pub vm_phase: HashMap<String, VmPhase>,
     pub vm_cpus: HashMap<String, u8>,
     pub vm_memory_mb: HashMap<String, u32>,
@@ -70,6 +76,8 @@ pub struct UiState {
     // Step timings
     pub step_prepare_started: Option<Instant>,
     pub step_prepare_elapsed: Option<Duration>,
+    pub step_download_started: Option<Instant>,
+    pub step_download_elapsed: Option<Duration>,
     pub step_hub_started: Option<Instant>,
     pub step_hub_elapsed: Option<Duration>,
     pub step_metadata_started: Option<Instant>,
@@ -78,6 +86,12 @@ pub struct UiState {
     pub step_start_vms_elapsed: Option<Duration>,
     pub step_ssh_started: Option<Instant>,
     pub step_ssh_elapsed: Option<Duration>,
+    pub step_snapshot_started: Option<Instant>,
+    pub step_snapshot_elapsed: Option<Duration>,
+    // Snapshot/restore UI state
+    pub snapshot_ready: bool,
+    pub restoring: bool,
+    pub confirm_restore_active: bool,
 }
 
 impl UiState {
@@ -95,10 +109,12 @@ impl UiState {
             run_completed: None,
             quote: None,
             step_prepare: StepState::Pending,
+            step_download: StepState::Pending,
             step_hub: StepState::Pending,
             step_metadata: StepState::Pending,
             step_start_vms: StepState::Pending,
             step_ssh: StepState::Pending,
+            step_snapshot: StepState::Pending,
             vm_phase,
             vm_cpus: HashMap::new(),
             vm_memory_mb: HashMap::new(),
@@ -112,6 +128,8 @@ impl UiState {
             tick: 0,
             step_prepare_started: None,
             step_prepare_elapsed: None,
+            step_download_started: None,
+            step_download_elapsed: None,
             step_hub_started: None,
             step_hub_elapsed: None,
             step_metadata_started: None,
@@ -120,6 +138,11 @@ impl UiState {
             step_start_vms_elapsed: None,
             step_ssh_started: None,
             step_ssh_elapsed: None,
+            step_snapshot_started: None,
+            step_snapshot_elapsed: None,
+            snapshot_ready: false,
+            restoring: false,
+            confirm_restore_active: false,
         }
     }
 }
@@ -214,57 +237,9 @@ fn measure_wrapped_lines(text: &str, content_width: u16) -> u16 {
     lines
 }
 
-fn vm_rows(state: &UiState) -> Vec<Row<'static>> {
-    let th = theme();
-    let mut names: Vec<_> = state.vm_phase.keys().cloned().collect();
-    names.sort();
-    let mut rows: Vec<Row<'static>> = Vec::new();
-    for n in names {
-        let p = *state.vm_phase.get(&n).unwrap_or(&VmPhase::Pending);
-        let status_style = match p {
-            VmPhase::Pending => Style::default().fg(th.dim),
-            VmPhase::Starting | VmPhase::SshWait => Style::default().fg(th.warn),
-            VmPhase::Ready => Style::default().fg(th.success),
-        };
-        let status = match p {
-            VmPhase::Pending => String::from("pending"),
-            VmPhase::Starting => String::from("starting"),
-            VmPhase::SshWait => String::from("waiting for ssh"),
-            VmPhase::Ready => state
-                .vm_ssh_port
-                .get(&n)
-                .map_or_else(|| String::from("ready"), |p| format!("ready :{p}")),
-        };
-        let cpus = state
-            .vm_cpus
-            .get(&n)
-            .map_or_else(|| String::from("-"), ToString::to_string);
-        let mem = state
-            .vm_memory_mb
-            .get(&n)
-            .map_or_else(|| String::from("-"), |m| format!("{m}MB"));
-        let lan = state
-            .vm_lan_ip
-            .get(&n)
-            .cloned()
-            .unwrap_or_else(|| String::from("-"));
-        let ssh = state
-            .vm_ssh_port
-            .get(&n)
-            .map_or_else(|| String::from("-"), |p| format!(":{p}"));
-        let row = Row::new(vec![
-            Cell::from(n.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-            Cell::from(cpus.to_string()).style(Style::default().fg(Color::Gray)),
-            Cell::from(mem.to_string()).style(Style::default().fg(Color::Gray)),
-            Cell::from(lan.to_string()).style(Style::default().fg(Color::Gray)),
-            Cell::from(ssh.to_string()).style(Style::default().fg(th.primary)),
-            Cell::from(status.to_string()).style(status_style),
-        ])
-        .height(1);
-        rows.push(row);
-    }
-    rows
-}
+// Status color helper removed with tiles view
+
+// tiles view removed (replaced with table view)
 
 fn collect_problem_labels(
     vm_problems: &HashMap<String, Vec<(String, String)>>,
@@ -441,10 +416,16 @@ fn render_header(
     ]));
     f.render_widget(left, cols[0]);
 
-    let help_text = if enable_keys {
-        String::from("Ctrl+C to stop & clean up")
+    let help_text = if guard.confirm_restore_active {
+        String::from("Confirm reset? [y/N]")
+    } else if guard.restoring {
+        String::from("Resetting…")
+    } else if enable_keys && guard.snapshot_ready {
+        String::from("Ctrl+C quit • Ctrl+R reset")
+    } else if enable_keys {
+        String::from("Ctrl+C quit")
     } else {
-        String::from("Ctrl+C (signal) to stop & clean up")
+        String::from("Ctrl+C (signal) quit")
     };
     let right = Paragraph::new(help_text)
         .style(Style::default().fg(th.dim))
@@ -465,22 +446,47 @@ fn render_description(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, 
     f.render_widget(par, area);
 }
 
-fn render_steps(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard: &UiState) {
+fn build_steps_lines(guard: &UiState) -> Vec<Line<'static>> {
     let now = Instant::now();
-    // Overall boot timer for the title: run from run_started until run_completed (if set)
-    let overall = guard.run_completed.map_or_else(
-        || now.saturating_duration_since(guard.run_started),
-        |done| done.saturating_duration_since(guard.run_started),
-    );
-    let overall_str = fmt_dur(overall);
-
     // Suffix per step: individual time for that step only
+    // Download progress in bytes (downloaded, total?) from runtime progress file
+    fn read_download_bytes(scenario: &str) -> Option<(u64, Option<u64>)> {
+        let dirs = IntarDirs::new().ok()?;
+        let path = dirs
+            .runtime_scenario_dir(scenario)
+            .join("image-download.json");
+        let bytes = std::fs::read(&path).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let downloaded = v.get("downloaded").and_then(|x| x.as_u64())?;
+        let total = v.get("total").and_then(|x| x.as_u64());
+        Some((downloaded, total))
+    }
     let prep_suffix = match guard.step_prepare {
         StepState::Pending => None,
         StepState::Running => guard
             .step_prepare_started
             .map(|t| fmt_dur(now.saturating_duration_since(t))),
         StepState::Done => guard.step_prepare_elapsed.map(fmt_dur),
+    };
+    let dl_suffix = match guard.step_download {
+        StepState::Pending => None,
+        StepState::Running => {
+            let tpart = guard
+                .step_download_started
+                .map(|t| fmt_dur(now.saturating_duration_since(t)))
+                .unwrap_or_default();
+            let suffix = if let Some((dl, total)) = read_download_bytes(&guard.scenario_name) {
+                let mb = |b: u64| (b as f64) / (1024.0 * 1024.0);
+                match total {
+                    Some(t) if t > 0 => format!("{:.1}/{:.1} MB • {tpart}", mb(dl), mb(t)),
+                    _ => format!("{:.1} MB • {tpart}", mb(dl)),
+                }
+            } else {
+                format!("… • {tpart}")
+            };
+            Some(suffix)
+        }
+        StepState::Done => guard.step_download_elapsed.map(fmt_dur),
     };
     let hub_suffix = match guard.step_hub {
         StepState::Pending => None,
@@ -510,8 +516,21 @@ fn render_steps(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard:
             .map(|t| fmt_dur(now.saturating_duration_since(t))),
         StepState::Done => guard.step_ssh_elapsed.map(fmt_dur),
     };
+    let snap_suffix = match guard.step_snapshot {
+        StepState::Pending => None,
+        StepState::Running => guard
+            .step_snapshot_started
+            .map(|t| fmt_dur(now.saturating_duration_since(t))),
+        StepState::Done => guard.step_snapshot_elapsed.map(fmt_dur),
+    };
 
-    let steps = vec![
+    vec![
+        step_text(
+            "Downloading image",
+            guard.step_download,
+            guard.tick,
+            dl_suffix,
+        ),
         step_text(
             "Preparing resources",
             guard.step_prepare,
@@ -548,7 +567,27 @@ fn render_steps(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard:
             start_vms_suffix,
         ),
         step_text("Waiting for SSH", guard.step_ssh, guard.tick, ssh_suffix),
-    ];
+        step_text(
+            "Saving snapshot",
+            guard.step_snapshot,
+            guard.tick,
+            snap_suffix,
+        ),
+    ]
+}
+
+fn render_steps(
+    f: &mut ratatui::Frame<'_>,
+    area: ratatui::prelude::Rect,
+    guard: &UiState,
+    steps: Vec<Line<'static>>,
+) {
+    let now = Instant::now();
+    let overall = guard.run_completed.map_or_else(
+        || now.saturating_duration_since(guard.run_started),
+        |done| done.saturating_duration_since(guard.run_started),
+    );
+    let overall_str = fmt_dur(overall);
     let steps_par = Paragraph::new(steps).block(
         Block::bordered()
             .title(Line::from(vec![
@@ -556,8 +595,9 @@ fn render_steps(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard:
                 Span::styled(format!("({overall_str})"), Style::default().fg(theme().dim)),
                 Span::raw(" "),
             ]))
+            .title_alignment(Alignment::Center)
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Plain)
             .border_style(Style::default().fg(theme().border))
             .padding(Padding::new(1, 1, 1, 1)),
     );
@@ -578,8 +618,9 @@ fn render_quote(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard:
         let mut par = Paragraph::new(content).block(
             Block::bordered()
                 .title(" Random Stargate Quote ")
+                .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Plain)
                 .border_style(Style::default().fg(theme().border))
                 .padding(Padding::new(1, 1, 1, 1)),
         );
@@ -594,38 +635,253 @@ fn render_quote(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard:
     }
 }
 
-fn render_vm_table(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard: &UiState) {
-    let rows = vm_rows(guard);
-    let table = Table::new(
+const fn phase_label(phase: VmPhase) -> &'static str {
+    match phase {
+        VmPhase::Pending => "Pending",
+        VmPhase::Starting => "Starting",
+        VmPhase::SshWait => "SSH",
+        VmPhase::Ready => "Ready",
+    }
+}
+
+// (status span helper inlined into render function)
+
+// --- VM table helpers (extracted to reduce function size) ---
+#[derive(Clone)]
+struct VmRowData {
+    name: String,
+    cpu: String,
+    ram: String,
+    lan: String,
+    ssh: String,
+    phase: VmPhase,
+}
+
+fn center_text(label: &str, width: u16) -> String {
+    let len = u16::try_from(label.chars().count()).unwrap_or(0);
+    if width <= len {
+        return label.to_string();
+    }
+    let pad = width - len;
+    let left = pad / 2;
+    let right = pad - left;
+    format!(
+        "{:<left$}{label}{:>right$}",
+        "",
+        "",
+        left = usize::from(left),
+        right = usize::from(right)
+    )
+}
+
+type WidthMaxes = (u16, u16, u16, u16, u16, u16);
+type WidthsAndSpacing = (u16, u16, u16, u16, u16, u16, u16, u16);
+
+fn collect_vm_rows(guard: &UiState) -> (Vec<VmRowData>, WidthMaxes) {
+    let mut names: Vec<_> = guard.vm_phase.keys().cloned().collect();
+    names.sort();
+    let mut rows: Vec<VmRowData> = Vec::with_capacity(names.len());
+    let mut max_name = u16::try_from("Name".chars().count()).unwrap_or(0);
+    let mut max_cpu = u16::try_from("CPU".chars().count()).unwrap_or(0);
+    let mut max_ram = u16::try_from("RAM".chars().count()).unwrap_or(0);
+    let mut max_lan = u16::try_from("Internal LAN IP".chars().count()).unwrap_or(0);
+    let mut max_ssh = u16::try_from("SSH Port".chars().count()).unwrap_or(0);
+    let mut max_status = u16::try_from("Status".chars().count()).unwrap_or(0);
+    for name in names {
+        let cpu = guard
+            .vm_cpus
+            .get(&name)
+            .copied()
+            .map_or_else(|| "-".to_string(), |v| format!("{v}"));
+        let ram = guard
+            .vm_memory_mb
+            .get(&name)
+            .copied()
+            .map_or_else(|| "-".to_string(), |mb| format!("{mb} MiB"));
+        let lan = guard
+            .vm_lan_ip
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| "-".to_string());
+        let ssh = guard
+            .vm_ssh_port
+            .get(&name)
+            .copied()
+            .map_or_else(|| "-".to_string(), |p| format!("{p}"));
+        let phase = *guard.vm_phase.get(&name).unwrap_or(&VmPhase::Pending);
+        max_name = max_name.max(u16::try_from(name.chars().count()).unwrap_or(0));
+        max_cpu = max_cpu.max(u16::try_from(cpu.chars().count()).unwrap_or(0));
+        max_ram = max_ram.max(u16::try_from(ram.chars().count()).unwrap_or(0));
+        max_lan = max_lan.max(u16::try_from(lan.chars().count()).unwrap_or(0));
+        max_ssh = max_ssh.max(u16::try_from(ssh.chars().count()).unwrap_or(0));
+        max_status = max_status.max(u16::try_from(phase_label(phase).chars().count()).unwrap_or(0));
+        rows.push(VmRowData {
+            name,
+            cpu,
+            ram,
+            lan,
+            ssh,
+            phase,
+        });
+    }
+    (
         rows,
-        [
-            Constraint::Percentage(18), // VM
-            Constraint::Length(5),      // CPU
-            Constraint::Length(7),      // Mem
-            Constraint::Length(16),     // LAN
-            Constraint::Length(8),      // SSH
-            Constraint::Percentage(46), // Status
-        ],
+        (max_name, max_cpu, max_ram, max_lan, max_ssh, max_status),
     )
-    .column_spacing(1)
-    .header(
-        Row::new(vec!["VM", "CPU", "Mem", "LAN", "SSH", "Status"]) //
-            .style(
-                Style::default()
-                    .fg(theme().primary)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .height(1),
+}
+
+fn compute_vm_table_widths(area: ratatui::prelude::Rect, maxs: WidthMaxes) -> WidthsAndSpacing {
+    let (max_name, max_cpu, max_ram, max_lan, max_ssh, max_status) = maxs;
+    let header_pad: u16 = 0;
+    let mut name_w = max_name.saturating_add(header_pad);
+    let cpu_w = max_cpu.saturating_add(header_pad).max(3);
+    let ram_w = max_ram.saturating_add(header_pad).max(3);
+    let lan_w = max_lan;
+    let ssh_w = max_ssh;
+    let mut status_w = max_status.max(u16::try_from("Status".chars().count()).unwrap_or(0));
+    status_w = status_w.saturating_add(2).min(20);
+    let ncols: u16 = 6;
+    let col_spacing: u16 = 3;
+    let inner_w = area.width.saturating_sub(2).saturating_sub(2);
+    let spacing_total = col_spacing.saturating_mul(ncols.saturating_sub(1));
+    let usable_w = inner_w.saturating_sub(spacing_total);
+    let total_fixed = cpu_w
+        .saturating_add(ram_w)
+        .saturating_add(lan_w)
+        .saturating_add(ssh_w)
+        .saturating_add(status_w);
+    if usable_w > total_fixed {
+        let available_for_name = usable_w - total_fixed;
+        name_w = name_w.min(available_for_name.max(4));
+    } else {
+        name_w = 4;
+    }
+    (
+        name_w,
+        cpu_w,
+        ram_w,
+        lan_w,
+        ssh_w,
+        status_w,
+        col_spacing,
+        usable_w,
     )
-    .block(
-        Block::bordered()
-            .title(" VM Status ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme().border))
-            .padding(Padding::new(1, 1, 1, 1)),
-    );
+}
+
+fn build_vm_header(widths: (u16, u16, u16, u16, u16, u16)) -> Row<'static> {
+    let (name_w, cpu_w, ram_w, lan_w, ssh_w, status_w) = widths;
+    Row::new(vec![
+        Cell::from(Span::styled(
+            center_text("Name", name_w),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            center_text("CPU", cpu_w),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            center_text("RAM", ram_w),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            center_text("Internal LAN IP", lan_w),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            center_text("SSH Port", ssh_w),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            center_text("Status", status_w),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ])
+}
+
+fn build_vm_rows(
+    rows: Vec<VmRowData>,
+    widths: (u16, u16, u16, u16, u16, u16),
+) -> Vec<Row<'static>> {
+    let (name_w, cpu_w, ram_w, lan_w, ssh_w, status_w) = widths;
+    let mut out = Vec::with_capacity(rows.len());
+    for VmRowData {
+        name,
+        cpu,
+        ram,
+        lan,
+        ssh,
+        phase,
+    } in rows
+    {
+        let status_span = Span::styled(
+            center_text(phase_label(phase), status_w),
+            Style::default()
+                .fg(match phase {
+                    VmPhase::Pending => theme().dim,
+                    VmPhase::Starting => theme().warn,
+                    VmPhase::SshWait => Color::Blue,
+                    VmPhase::Ready => theme().success,
+                })
+                .add_modifier(Modifier::BOLD),
+        );
+        out.push(Row::new(vec![
+            Cell::from(Span::raw(center_text(&name, name_w))),
+            Cell::from(Span::styled(
+                center_text(&cpu, cpu_w),
+                Style::default().fg(theme().dim),
+            )),
+            Cell::from(Span::styled(
+                center_text(&ram, ram_w),
+                Style::default().fg(theme().dim),
+            )),
+            Cell::from(Span::raw(center_text(&lan, lan_w))),
+            Cell::from(Span::styled(
+                center_text(&ssh, ssh_w),
+                Style::default().fg(theme().dim),
+            )),
+            Cell::from(status_span),
+        ]));
+    }
+    out
+}
+
+fn render_vm_status_table(
+    f: &mut ratatui::Frame<'_>,
+    area: ratatui::prelude::Rect,
+    guard: &UiState,
+) {
+    let th = theme();
+    let (rows_raw, maxs) = collect_vm_rows(guard);
+    let (name_w, cpu_w, ram_w, lan_w, ssh_w, status_w, col_spacing, _usable_w) =
+        compute_vm_table_widths(area, maxs);
+    let widths_arr = [
+        Constraint::Length(name_w),
+        Constraint::Length(cpu_w),
+        Constraint::Length(ram_w),
+        Constraint::Length(lan_w),
+        Constraint::Length(ssh_w),
+        Constraint::Length(status_w),
+    ];
+    let header = build_vm_header((name_w, cpu_w, ram_w, lan_w, ssh_w, status_w))
+        .style(Style::default().fg(th.primary));
+    let rows = build_vm_rows(rows_raw, (name_w, cpu_w, ram_w, lan_w, ssh_w, status_w));
+    let table = Table::new(rows, widths_arr)
+        .header(header)
+        .column_spacing(col_spacing)
+        .block(
+            Block::bordered()
+                .title(" VMs ")
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(th.border))
+                .padding(Padding::new(1, 1, 1, 1)),
+        );
     f.render_widget(table, area);
+}
+
+fn render_vm_table(f: &mut ratatui::Frame<'_>, area: ratatui::prelude::Rect, guard: &UiState) {
+    render_vm_status_table(f, area, guard);
 }
 
 fn render_problems_panel(
@@ -646,8 +902,9 @@ fn render_problems_panel(
         let par = Paragraph::new(lines).block(
             Block::bordered()
                 .title(format!(" Problems (Fixes {fixed}/{total}) "))
+                .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Plain)
                 .border_style(Style::default().fg(theme().border))
                 .padding(Padding::new(1, 1, 1, 1)),
         );
@@ -717,8 +974,9 @@ fn render_problems_panel(
     let par = Paragraph::new(lines).block(
         Block::bordered()
             .title(format!(" Problems (Fixes 0/{total_pairs}) "))
+            .title_alignment(Alignment::Center)
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Plain)
             .border_style(Style::default().fg(theme().border))
             .padding(Padding::new(1, 1, 1, 1)),
     );
@@ -756,10 +1014,18 @@ fn render_frame(
         let body = measure_wrapped_lines(&guard.scenario_description, content_w);
         body.saturating_add(pad_tb)
     };
-    // VM table height: header(1) + rows(1 each) + top/bottom padding(2) + borders(2)
-    let vm_rows = u16::try_from(guard.vm_phase.len()).unwrap_or(0);
-    let vm_table_height: u16 = 1 + vm_rows + 2 + 2;
-    let vm_table_height = vm_table_height.max(5); // minimum to show header + padding + borders
+    // VM table height: header + one row per VM + borders/padding
+    let vms_count = u16::try_from(guard.vm_phase.len()).unwrap_or(0);
+    let header_rows: u16 = 1;
+    let wrapper_overhead_v: u16 = 4; // borders(2) + padding(2)
+    let table_rows = vms_count.saturating_add(header_rows);
+    let vm_table_height = table_rows.saturating_add(wrapper_overhead_v).max(5);
+    // Steps block height: number of step lines + vertical padding (2) + borders (2)
+    let steps_count = {
+        let tmp = build_steps_lines(guard);
+        u16::try_from(tmp.len()).unwrap_or(0)
+    };
+    let steps_block_height: u16 = steps_count.saturating_add(4);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -767,8 +1033,8 @@ fn render_frame(
             Constraint::Length(2),
             Constraint::Length(desc_height),
             Constraint::Length(quote_min_height),
-            // Exactly 5 items tall: 5 lines + 1 bottom padding + 2 borders = 8
-            Constraint::Length(9),
+            // Steps block height (dynamic)
+            Constraint::Length(steps_block_height),
             Constraint::Length(vm_table_height),
             Constraint::Min(3),
         ])
@@ -776,7 +1042,9 @@ fn render_frame(
     render_header(f, chunks[0], guard, enable_keys);
     render_description(f, chunks[1], guard);
     render_quote(f, chunks[2], guard);
-    render_steps(f, chunks[3], guard);
+    // Build steps once for height and reuse for rendering
+    let steps_lines = build_steps_lines(guard);
+    render_steps(f, chunks[3], guard, steps_lines);
     render_vm_table(f, chunks[4], guard);
     render_problems_panel(
         f,
@@ -786,6 +1054,92 @@ fn render_frame(
         problem_descs_snapshot,
         problem_probes_snapshot,
     );
+
+    // Draw confirmation modal on top when active
+    if guard.confirm_restore_active {
+        render_confirm_modal(f, size, guard);
+    }
+}
+
+fn render_confirm_modal(f: &mut ratatui::Frame<'_>, area: Rect, guard: &UiState) {
+    // Centered rectangle (60% width, 30% height)
+    let outer = area;
+    let vw = outer.width;
+    let vh = outer.height;
+    let mw = (vw.saturating_mul(60) / 100).max(30); // min width ~30 cols
+    let mh = (vh.saturating_mul(30) / 100).max(7); // min height ~7 rows
+    let x = outer.x + (vw.saturating_sub(mw)) / 2;
+    let y = outer.y + (vh.saturating_sub(mh)) / 2;
+    let modal = Rect {
+        x,
+        y,
+        width: mw,
+        height: mh,
+    };
+
+    // Clear background under modal
+    f.render_widget(Clear, modal);
+
+    let th = theme();
+
+    let scenario = guard.scenario_name.clone();
+    let total_vms = guard.total_vms;
+
+    let lines = vec![
+        Line::from("").alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("⚠ ", Style::default().fg(th.warn)),
+            Span::styled(
+                "Reset to last save point?".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .alignment(Alignment::Center),
+        Line::from("").alignment(Alignment::Center),
+        Line::from(Span::styled(
+            format!("Scenario: {scenario} • VMs: {total_vms}"),
+            Style::default().fg(th.dim),
+        ))
+        .alignment(Alignment::Center),
+        Line::from("").alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "Resets all VMs to the saved checkpoint.",
+            Style::default().fg(th.dim),
+        ))
+        .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "Unsaved progress inside VMs will be lost.",
+            Style::default().fg(th.error),
+        ))
+        .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "This action cannot be undone.",
+            Style::default().fg(th.warn),
+        ))
+        .alignment(Alignment::Center),
+        Line::from("").alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("[y]", Style::default().fg(th.success)),
+            Span::raw(" Reset   "),
+            Span::styled("[N]/Esc", Style::default()),
+            Span::raw(" Cancel "),
+            Span::styled("(default)", Style::default().fg(th.dim)),
+        ])
+        .alignment(Alignment::Center),
+    ];
+
+    let block = Block::bordered()
+        .title(" Reset ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(th.warn))
+        .padding(Padding::new(1, 1, 1, 1));
+
+    let par = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .block(block);
+    f.render_widget(par, modal);
 }
 
 fn spawn_draw_task(
@@ -847,12 +1201,16 @@ fn spawn_input_task(
     enable_keys: bool,
     quit_tx: tokio::sync::watch::Sender<bool>,
     quit_rx: tokio::sync::watch::Receiver<bool>,
+    shared: Arc<Mutex<UiState>>,
+    action_tx: broadcast::Sender<UiAction>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !enable_keys {
         return None;
     }
     let input_quit = quit_tx;
     let input_quit_rx = quit_rx;
+    let state = shared;
+    let actions = action_tx;
     Some(tokio::spawn(async move {
         // Poll keyboard events for Ctrl+C (inside TUI)
         loop {
@@ -863,11 +1221,32 @@ fn spawn_input_task(
             if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
                 && let Ok(Event::Key(key)) = event::read()
                 && key.kind == KeyEventKind::Press
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.code == KeyCode::Char('c')
             {
-                let _ = input_quit.send(true);
-                break;
+                // Confirm flow: if confirmation modal active, only accept y/N
+                if let Ok(guard) = state.try_lock()
+                    && guard.confirm_restore_active
+                {
+                    drop(guard);
+                    match key.code {
+                        KeyCode::Char('y' | 'Y') => {
+                            let _ = actions.send(UiAction::ConfirmRestore(true));
+                        }
+                        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                            let _ = actions.send(UiAction::ConfirmRestore(false));
+                        }
+                        _ => {}
+                    }
+                    // handled; continue polling
+                    continue;
+                }
+                // Regular shortcuts
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    let _ = input_quit.send(true);
+                    break;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+                    let _ = actions.send(UiAction::RestoreRequested);
+                }
             }
         }
     }))
@@ -880,6 +1259,7 @@ pub struct RunUi {
     input_handle: Option<tokio::task::JoinHandle<()>>,
     quit_tx: tokio::sync::watch::Sender<bool>,
     quit_rx: tokio::sync::watch::Receiver<bool>,
+    action_tx: broadcast::Sender<UiAction>,
 }
 
 impl RunUi {
@@ -901,14 +1281,22 @@ impl RunUi {
     pub fn new_with_options(initial: UiState, enable_keys: bool) -> Self {
         let shared = Arc::new(Mutex::new(initial));
         let (quit_tx, quit_rx) = tokio::sync::watch::channel(false);
+        let (action_tx, _action_rx) = broadcast::channel(16);
         let handle = spawn_draw_task(shared.clone(), enable_keys, quit_rx.clone());
-        let input_handle = spawn_input_task(enable_keys, quit_tx.clone(), quit_rx.clone());
+        let input_handle = spawn_input_task(
+            enable_keys,
+            quit_tx.clone(),
+            quit_rx.clone(),
+            shared.clone(),
+            action_tx.clone(),
+        );
         Self {
             state: shared,
             handle,
             input_handle,
             quit_tx,
             quit_rx,
+            action_tx,
         }
     }
 
@@ -940,4 +1328,16 @@ impl RunUi {
     pub fn quit_requested(&self) -> bool {
         *self.quit_rx.borrow()
     }
+
+    /// Subscribe to UI actions (e.g., Ctrl+R restore request, confirmations).
+    pub fn action_subscribe(&self) -> broadcast::Receiver<UiAction> {
+        self.action_tx.subscribe()
+    }
+}
+
+/// UI actions emitted by the input task and consumed in the main loop.
+#[derive(Clone, Debug)]
+pub enum UiAction {
+    RestoreRequested,
+    ConfirmRestore(bool),
 }

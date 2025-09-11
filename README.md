@@ -12,11 +12,11 @@ Quickstart (rootless)
   - Debian/Ubuntu: `sudo apt-get install qemu-system qemu-utils genisoimage` (or `xorriso`)
   - Fedora: `sudo dnf install qemu-system qemu-img genisoimage`
 - aarch64 firmware: install EDK2/UEFI (e.g., `edk2-aarch64`); the path is auto-detected.
-- Run (foreground): `cargo run --bin intar -- scenario run MultiDemo`
+- Run (foreground): `cargo run --bin intar -- scenario run multiple-rocky-linux-vms`
   - Runs in the foreground with `tracing` logs and a TUI.
   - Press Ctrl+C to stop and clean up all scenario data.
-- SSH into a VM: `cargo run --bin intar -- scenario ssh MultiDemo web`
-- Status: `cargo run --bin intar -- scenario status MultiDemo`
+- SSH into a VM: `cargo run --bin intar -- scenario ssh multiple-rocky-linux-vms web`
+- Status: `cargo run --bin intar -- scenario status multiple-rocky-linux-vms`
 
 Networking model
 - Dual NIC per VM:
@@ -24,7 +24,7 @@ Networking model
   - Private LAN NIC: rootless L2 via built‑in UDP hub on localhost; all VMs join the same bus.
 - Inter-VM network: `172.30.<scenario_id>.0/24`, where `<scenario_id>` is derived from scenario name.
 - VM LAN IPs: `172.30.<scenario_id>.(10 + index)`; e.g. first VM gets `.10`, second `.11`, etc.
-- Poor man’s DNS: `/etc/hosts` is appended with entries like `cache cache-MultiDemo cache.MultiDemo` for each VM.
+- Poor man’s DNS: `/etc/hosts` is appended with entries like `cache cache-multiple-rocky-linux-vms cache.multiple-rocky-linux-vms` for each VM.
 
 Examples
 - SSH from host: `ssh -i ~/.local/share/intar/scenarios/<Scenario>/ssh-keys/id_ed25519 -p 2700 intar@127.0.0.1`
@@ -40,7 +40,7 @@ Notes
 
 Scenario spec (HCL)
 - Minimal:
-  - `name = "Demo"`
+  - `name = "single-ubuntu-vm"`
   - `image = "https://.../noble-server-cloudimg-arm64.img"`
   - `vm "vm1" {}`
 - Optional:
@@ -131,9 +131,9 @@ Dev workflow
 - Lint/format/tests: `just check` (fmt + clippy pedantic/nursery/cargo + tests)
 - Run examples:
   - `cargo run --bin intar -- scenario list`
-  - `RUST_LOG=info cargo run --bin intar -- scenario run MultiDemo`
-  - `cargo run --bin intar -- scenario status MultiDemo`
-  - `cargo run --bin intar -- scenario ssh MultiDemo web`
+  - `RUST_LOG=info cargo run --bin intar -- scenario run multiple-rocky-linux-vms`
+  - `cargo run --bin intar -- scenario status multiple-rocky-linux-vms`
+  - `cargo run --bin intar -- scenario ssh multiple-rocky-linux-vms web`
 
 Env knobs
 - `INTAR_QMP_CONNECT_TIMEOUT_MS`, `INTAR_QMP_COMMAND_TIMEOUT_MS` tune QMP timeouts.
@@ -173,7 +173,8 @@ Clippy
   - Open ports: `intar_agent_open_port{proto,port}`, `intar_agent_open_ports_total`
   - Users/groups: `intar_agent_user_group{user,group}`, `..._users_total`, `..._groups_total`
   - Files (whitelist): `..._file_exists|mode|uid|gid{path}`
-  - sshd security: presence, port, auth booleans, crypto lists, forwarding/limits, access lists
+  - Generic settings (DSL): `intar_agent_setting{path,subsystem?,key?,value[,column]?}` emitted by file extractors
+    - Examples: extract `Ciphers` list from sshd config files, nameservers from resolv.conf, rows from fstab
 
 Host OTLP collector example
 ```

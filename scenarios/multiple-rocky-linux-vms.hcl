@@ -1,15 +1,16 @@
-name = "MultiDemo"
+name = "multiple-rocky-linux-vms"
+display_name = "Multiple Rocky Linux VMs"
 
 description = <<EOF
-Multi-VM scenario for testing VM-to-VM communication and isolation.
-Tests networking between multiple VMs in the same scenario.
+Multi‑VM scenario demonstrating VM‑to‑VM communication and isolation (Rocky Linux 9).
+Includes a simple shared task: set /home/intar/intar.txt to 'INTAR READY' on each VM.
 EOF
 
-image = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+image = "https://dl.rockylinux.org/pub/rocky/9/images/aarch64/Rocky-9-GenericCloud.latest.aarch64.qcow2"
 
 // Simple problem: manage a whitelisted file in the intar home
-problem "motd-welcome" {
-  description = "Ensure /home/intar/intar.txt contains the expected text"
+problem "file-fixed" {
+  description = "Ensure /home/intar/intar.txt contains 'INTAR READY'"
 
   // Minimal manipulation only; no tools or probes
   manipulation {
@@ -22,7 +23,7 @@ problem "motd-welcome" {
   }
 
   // Probe: verify /home/intar/intar.txt content is set as expected
-  probe "motd_set" {
+  probe "intar_txt_fixed" {
     metric = "intar_agent_file_content"
     labels = { path = "/home/intar/intar.txt", content = "INTAR READY" }
     op     = "eq"
@@ -31,11 +32,11 @@ problem "motd-welcome" {
 }
 
 vm "web" {
-  problems = ["motd-welcome"]
+  problems = ["file-fixed"]
 }
 vm "db" {
-  problems = ["motd-welcome"]
+  problems = ["file-fixed"]
 }
 vm "cache" {
-  problems = ["motd-welcome"]
+  problems = ["file-fixed"]
 }

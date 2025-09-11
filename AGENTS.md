@@ -17,7 +17,7 @@
 - Lint/format/tests (recommended): `just check`
   - Runs `cargo fmt`, `cargo clippy` with `-W clippy::pedantic -W clippy::nursery -W clippy::cargo`, then tests (`cargo nextest` or `cargo test`).
   - You may see “multiple crate versions” warnings due to transitive deps; these are acceptable.
-- Logs: `RUST_LOG=info cargo run --bin intar -- scenario run MultiDemo`
+- Logs: `RUST_LOG=info cargo run --bin intar -- scenario run multiple-rocky-linux-vms`
 
  
 

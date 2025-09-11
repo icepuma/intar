@@ -1,9 +1,10 @@
 use anyhow::{Context, Result as AnyhowResult, bail};
-use base64::Engine as _;
 use clap::{Parser, Subcommand};
+use intar::embedded_agent;
 // TUI handles UX; non-interactive logs are also emitted
 use intar::VmStatus;
 use intar::scenario_runner::ScenarioRunner;
+use intar_local_backend::Backend;
 use intar_scenario::{list_embedded_scenarios, read_embedded_scenario};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -14,7 +15,7 @@ use std::time::Instant;
 #[command(about = "A CLI tool for managing intar scenarios")]
 #[command(version)]
 #[command(
-    after_help = "Examples:\n  intar scenario list\n  intar scenario run MultiDemo  # starts scenario in foreground; Ctrl+C to stop\n  intar scenario status MultiDemo\n  intar scenario ssh MultiDemo web\n"
+    after_help = "Examples:\n  intar scenario list\n  intar scenario run multiple-rocky-linux-vms  # starts scenario in foreground; Ctrl+C to stop\n  intar scenario status multiple-rocky-linux-vms\n  intar scenario ssh multiple-rocky-linux-vms web\n"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -43,7 +44,6 @@ async fn wait_for_signal() {
 
 type SshEndpoint = (String, String, u16, String, String); // (vm_name, host, port, user, key_path)
 
-mod bundle;
 mod metrics;
 mod probes;
 mod quotes;
@@ -344,10 +344,14 @@ async fn prepare_and_start_services(
 )> {
     {
         let mut st = ui.state.lock().await;
-        st.step_prepare = crate::tui::StepState::Running;
-        if st.step_prepare_started.is_none() {
-            st.step_prepare_started = Some(Instant::now());
+        // Download step starts first (shows percent from progress file)
+        st.step_download = crate::tui::StepState::Running;
+        if st.step_download_started.is_none() {
+            st.step_download_started = Some(Instant::now());
         }
+        // Keep "Preparing resources" pending to avoid dual spinners during download
+        st.step_prepare = crate::tui::StepState::Pending;
+        st.step_prepare_started = None;
     }
     runner
         .prepare()
@@ -355,10 +359,13 @@ async fn prepare_and_start_services(
         .context("Failed to prepare scenario")?;
     {
         let mut st = ui.state.lock().await;
-        st.step_prepare = crate::tui::StepState::Done;
-        if let Some(t0) = st.step_prepare_started.take() {
-            st.step_prepare_elapsed = Some(t0.elapsed());
+        st.step_download = crate::tui::StepState::Done;
+        if let Some(t0) = st.step_download_started.take() {
+            st.step_download_elapsed = Some(t0.elapsed());
         }
+        // Mark prepare as done without a spinner; duration not tracked separately
+        st.step_prepare = crate::tui::StepState::Done;
+        st.step_prepare_elapsed = Some(std::time::Duration::from_millis(0));
         st.step_hub = crate::tui::StepState::Running;
         if st.step_hub_started.is_none() {
             st.step_hub_started = Some(Instant::now());
@@ -397,45 +404,30 @@ async fn prepare_and_start_services(
 }
 
 fn configure_agent_env(runner: &ScenarioRunner, scenario_name: &str) {
-    if let Some(agent_path) =
-        bundle::resolve_agent_path(runner.scenario.local_agent.unwrap_or(false))
-            .ok()
-            .flatten()
-    {
-        tracing::info!("Using agent from: {}", agent_path.display());
-        // Prefer embedding the agent via gz+b64 for faster startup over ISO mounting
-        match std::fs::read(&agent_path)
-            .map_err(|e| anyhow::anyhow!("read agent binary: {}", e))
-            .and_then(|bytes| {
-                use flate2::Compression;
-                use flate2::write::GzEncoder;
-                use std::io::Write as _;
-                let mut enc = GzEncoder::new(Vec::new(), Compression::best());
-                enc.write_all(&bytes)
-                    .map_err(|e| anyhow::anyhow!("gzip agent: {}", e))?;
-                let gz = enc
-                    .finish()
-                    .map_err(|e| anyhow::anyhow!("finalize gzip: {}", e))?;
-                Ok(base64::engine::general_purpose::STANDARD.encode(gz))
-            }) {
-            Ok(gzb64) => unsafe {
-                std::env::set_var("INTAR_AGENT_BUNDLE_GZB64", gzb64);
-                // Clear ISO path usage to avoid duplicate methods
-                std::env::remove_var("INTAR_AGENT_FROM_ISO");
-                std::env::remove_var("INTAR_AGENT_PATH");
-            },
-            Err(e) => {
-                tracing::warn!("Falling back to agent ISO injection: {}", e);
-                unsafe {
-                    std::env::set_var("INTAR_AGENT_PATH", &agent_path);
-                    std::env::set_var("INTAR_AGENT_FROM_ISO", "1");
-                }
-            }
-        }
-    } else {
-        tracing::info!(
-            "No agent provided (set INTAR_AGENT_BUNDLE or local_agent=true to inject one)"
+    // Always inject embedded agent (raw bytes), mounted via ISO in the guest.
+    // Choose embedded binary by host arch (matches QEMU arch selection).
+    let bytes = embedded_agent::embedded_agent_for_host();
+    // Persist under scenario data dir so each VM can mount an ISO from this file
+    let dirs = intar_local_backend::IntarDirs::new().expect("dirs init");
+    let agent_out = dirs
+        .data_scenario_dir(scenario_name)
+        .join("embedded-agent")
+        .join("intar-agent");
+    if let Some(parent) = agent_out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if let Err(e) = std::fs::write(&agent_out, bytes) {
+        tracing::warn!(
+            "Failed to write embedded agent to {}: {}",
+            agent_out.display(),
+            e
         );
+    } else {
+        tracing::info!("Using embedded agent at: {}", agent_out.display());
+        unsafe {
+            std::env::set_var("INTAR_AGENT_PATH", &agent_out);
+            std::env::set_var("INTAR_AGENT_FROM_ISO", "1");
+        }
     }
 
     if let Some(ref ep) = runner.scenario.agent_otlp_endpoint {
@@ -667,13 +659,18 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
     }
     mark_ssh_done_and_complete_run(&ui).await;
 
-    // Probes already running; proceed to interactive wait
+    // After SSH is available, spawn background initial VM snapshots (best-effort)
+    {
+        let mut st = ui.state.lock().await;
+        st.step_snapshot = crate::tui::StepState::Running;
+        if st.step_snapshot_started.is_none() {
+            st.step_snapshot_started = Some(Instant::now());
+        }
+    }
+    spawn_initial_snapshots(&runner, &ui);
 
-    // Wait for Ctrl+C/Signals or UI quit
-    let was_tui_quit = tokio::select! {
-        () = wait_for_signal() => { false },
-        () = ui.wait_for_quit() => { true },
-    };
+    // Probes already running; proceed to interactive wait
+    let was_tui_quit = run_interactive_session(&ui, &runner, &scenario_name).await;
 
     // Stop probes engine task then finalize shutdown
     probe_task.abort();
@@ -682,6 +679,112 @@ async fn run_scenario(name: &str) -> AnyhowResult<()> {
     })
     .await;
     shutdown_phase(name, ui, &mut runner, hub_task, md_task, was_tui_quit).await
+}
+
+async fn run_interactive_session(
+    ui: &crate::tui::RunUi,
+    runner: &ScenarioRunner,
+    scenario_name: &str,
+) -> bool {
+    let mut action_rx = ui.action_subscribe();
+    loop {
+        tokio::select! {
+            () = wait_for_signal() => { return false; },
+            () = ui.wait_for_quit() => { return true; },
+            Ok(action) = action_rx.recv() => {
+                match action {
+                    crate::tui::UiAction::RestoreRequested => {
+                        let mut guard = ui.state.lock().await;
+                        guard.confirm_restore_active = guard.snapshot_ready;
+                    }
+                    crate::tui::UiAction::ConfirmRestore(yes) => {
+                        let mut guard = ui.state.lock().await;
+                        let do_restore = guard.confirm_restore_active && yes;
+                        guard.confirm_restore_active = false;
+                        if do_restore {
+                            guard.restoring = true;
+                        }
+                        drop(guard);
+                        if do_restore {
+                            let restore_name = "snapshot".to_string();
+                            let vm_names = sorted_vm_names(runner);
+                            for vm_name in &vm_names {
+                                if let Some(vm) = runner.vms.get(vm_name) {
+                                    let _ = vm.snapshot_restore(&restore_name).await;
+                                }
+                            }
+                            if let Ok(endpoints) = collect_ssh_endpoints(runner, &vm_names, scenario_name).await {
+                                wait_for_ssh_with_ui(ui, &endpoints).await;
+                            }
+                            let mut g = ui.state.lock().await;
+                            g.restoring = false;
+                        }
+                    }
+                }
+            }
+            else => {}
+        }
+    }
+}
+
+fn spawn_initial_snapshots(runner: &ScenarioRunner, ui: &crate::tui::RunUi) {
+    let scenario_name = runner.scenario.name.clone();
+    let vm_names = sorted_vm_names(runner);
+    let snap_name = "snapshot".to_string();
+    let ui_state = ui.state.clone();
+    tokio::spawn(async move {
+        // Use a fresh backend instance to operate via QMP
+        let backend = match intar_local_backend::LocalBackend::new() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Snapshot backend init failed: {}", e);
+                return;
+            }
+        };
+        // Build a minimal Scenario for state loading (only name is used)
+        let minimal = intar_scenario::Scenario {
+            name: scenario_name.clone(),
+            description: String::new(),
+            image: String::new(),
+            sha256: None,
+            agent_otlp_endpoint: None,
+            local_agent: None,
+            vm: std::collections::HashMap::new(),
+            problems: indexmap::IndexMap::new(),
+        };
+        let mut all_ok = true;
+        for vmn in vm_names {
+            match backend.load_vm_from_state(vmn.clone(), &minimal).await {
+                Ok(Some(vm)) => {
+                    if let Err(e) = vm.snapshot_save(&snap_name).await {
+                        tracing::warn!("Initial snapshot failed for {}: {}", vmn, e);
+                        all_ok = false;
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!("VM not found for snapshot: {}", vmn);
+                    all_ok = false;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open VM for snapshot {}: {}", vmn, e);
+                    all_ok = false;
+                }
+            }
+        }
+        // Update UI: mark snapshot step done and show Ctrl+R only on success
+        let mut g = ui_state.lock().await;
+        g.step_snapshot = crate::tui::StepState::Done;
+        if let Some(t0) = g.step_snapshot_started.take() {
+            g.step_snapshot_elapsed = Some(t0.elapsed());
+        }
+        if all_ok {
+            tracing::info!("Snapshot saved");
+            g.snapshot_ready = true;
+        } else {
+            tracing::warn!("Snapshot save completed with some errors");
+        }
+        drop(g);
+    });
 }
 
 async fn mark_vms_ready_for_ssh(ui: &crate::tui::RunUi) {

@@ -80,7 +80,7 @@ impl QemuConfig {
             other => anyhow::bail!("Unsupported architecture: {}", other),
         };
 
-        // OS-specific acceleration
+        // OS-specific acceleration (overridable via env)
         match os {
             "macos" => {
                 cfg.accel_args = vec!["-accel".to_string(), "hvf".to_string()];
@@ -90,6 +90,25 @@ impl QemuConfig {
                 cfg.cpu = "host".to_string();
             }
             _ => {}
+        }
+
+        // Allow explicit override: INTAR_ACCEL=tcg|hvf|kvm|none (useful to enable savevm/loadvm)
+        if let Ok(accel) = env::var("INTAR_ACCEL") {
+            let a = accel.to_ascii_lowercase();
+            cfg.accel_args = match a.as_str() {
+                "tcg" => vec!["-accel".to_string(), "tcg".to_string()],
+                "hvf" => vec!["-accel".to_string(), "hvf".to_string()],
+                "kvm" => vec!["-enable-kvm".to_string()],
+                "none" => Vec::new(),
+                other => {
+                    tracing::warn!("Unknown INTAR_ACCEL='{}', keeping default accel", other);
+                    cfg.accel_args.clone()
+                }
+            };
+        } else if env::var("INTAR_FORCE_TCG")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            cfg.accel_args = vec!["-accel".to_string(), "tcg".to_string()];
         }
 
         Ok(cfg)
